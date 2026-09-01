@@ -1,0 +1,516 @@
+---
+description: "Auth.js v5 (NextAuth) — configuration, providers, sessions, RBAC, edge runtime, and Cloudflare D1 adapter patterns"
+globs: ["**/auth.ts", "**/auth.config.ts", "**/middleware.ts", "**/*auth*/**", "**/next-auth.d.ts", "**/api/auth/**"]
+alwaysApply: false
+---
+
+# Auth.js v5 (NextAuth) Standards
+
+## Package Names
+
+Auth.js v5 is published as `next-auth@5.x` for Next.js. The core is `@auth/core`. The D1 adapter is `@auth/d1-adapter`. Never use `next-auth@4.x` patterns (e.g., `getServerSession`, `getToken` from `next-auth/jwt` at the top level, `[...nextauth].ts` pages router).
+
+```bash
+npm install next-auth@5 @auth/d1-adapter
+```
+
+## Split Configuration Pattern (Edge-Safe)
+
+Split auth config into two files to keep the edge-compatible middleware fast and avoid importing database adapters into edge bundles:
+
+### `auth.config.ts` — Edge-Safe (No DB Adapter)
+
+This file runs in edge middleware. It must NOT import database adapters, ORMs, or Node.js-only modules:
+
+```ts
+// src/auth.config.ts
+import type { NextAuthConfig } from "next-auth";
+import Google from "next-auth/providers/google";
+import GitHub from "next-auth/providers/github";
+
+export const authConfig = {
+  providers: [
+    Google({
+      clientId: process.env.AUTH_GOOGLE_ID!,
+      clientSecret: process.env.AUTH_GOOGLE_SECRET!,
+    }),
+    GitHub({
+      clientId: process.env.AUTH_GITHUB_ID!,
+      clientSecret: process.env.AUTH_GITHUB_SECRET!,
+    }),
+  ],
+  pages: {
+    signIn: "/login",
+    error: "/login",
+  },
+  callbacks: {
+    authorized({ auth, request: { nextUrl } }) {
+      const isLoggedIn = !!auth?.user;
+      const isProtected = nextUrl.pathname.startsWith("/dashboard");
+      if (isProtected && !isLoggedIn) {
+        return Response.redirect(new URL("/login", nextUrl));
+      }
+      return true;
+    },
+  },
+} satisfies NextAuthConfig;
+```
+
+### `auth.ts` — Full Config (With DB Adapter)
+
+This file adds the database adapter and exports the `auth()` function, handlers, and sign-in/sign-out methods. It runs in the Node.js runtime:
+
+```ts
+// src/auth.ts
+import NextAuth from "next-auth";
+import { authConfig } from "./auth.config";
+import { D1Adapter } from "@auth/d1-adapter";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+
+async function getAuthConfig() {
+  const { env } = await getCloudflareContext({ async: true });
+  return {
+    ...authConfig,
+    adapter: D1Adapter(env.DB),
+    session: { strategy: "jwt" as const },
+    trustHost: true,
+    secret: env.AUTH_SECRET,
+    callbacks: {
+      ...authConfig.callbacks,
+      async jwt({ token, user }) {
+        if (user) {
+          token.id = user.id;
+          token.role = user.role;
+        }
+        return token;
+      },
+      async session({ session, token }) {
+        if (token) {
+          session.user.id = token.id as string;
+          session.user.role = token.role as string;
+        }
+        return session;
+      },
+    },
+  };
+}
+
+const authResult = async () => NextAuth(await getAuthConfig());
+
+export const handlers = async () => (await authResult()).handlers;
+export const auth = async () => (await authResult()).auth();
+export const signIn = async () => (await authResult()).signIn;
+export const signOut = async () => (await authResult()).signOut;
+```
+
+### Cloudflare D1 Adapter — Table Setup
+
+The D1 adapter creates 4 tables: `accounts`, `sessions`, `users`, `verification_tokens`. Run the `up()` migration on first deploy:
+
+```ts
+// src/app/api/setup/route.ts (one-time setup endpoint)
+import { up } from "@auth/d1-adapter";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+
+export async function GET() {
+  const { env } = await getCloudflareContext({ async: true });
+  try {
+    await up(env.DB);
+    return new Response("Auth tables created", { status: 200 });
+  } catch (e: any) {
+    return new Response(e.message, { status: 500 });
+  }
+}
+```
+
+After running, remove or protect this endpoint.
+
+## Middleware — First Layer of Defense
+
+```ts
+// src/middleware.ts
+import NextAuth from "next-auth";
+import { authConfig } from "./auth.config";
+
+export const { auth: middleware } = NextAuth(authConfig);
+
+export const config = {
+  matcher: [
+    "/((?!api/auth|_next/static|_next/image|favicon.ico|login|register|public).*)",
+  ],
+};
+```
+
+**CRITICAL:** Middleware is a routing-level gate only. It can be bypassed (e.g., CVE-2025-29927). ALWAYS double-validate with `auth()` inside Server Components, Server Actions, and Route Handlers.
+
+## Defense in Depth — Always Double-Validate
+
+### In Server Components
+
+```ts
+// src/app/dashboard/page.tsx
+import { auth } from "@/auth";
+import { redirect } from "next/navigation";
+
+export default async function DashboardPage() {
+  const session = await auth();
+  if (!session?.user) redirect("/login");
+
+  return <Dashboard user={session.user} />;
+}
+```
+
+### In Server Actions
+
+```ts
+"use server";
+
+import { auth } from "@/auth";
+
+export async function updateProfile(formData: FormData) {
+  const session = await auth();
+  if (!session?.user) throw new Error("Unauthorized");
+
+  // ... perform mutation
+}
+```
+
+### In Route Handlers
+
+```ts
+// src/app/api/resumes/route.ts
+import { auth } from "@/auth";
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  const session = await auth();
+  if (!session?.user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // ... return data
+}
+```
+
+## TypeScript Module Augmentation
+
+Auth.js v5 silently drops custom session fields unless you augment the types AND copy them through callbacks. Both steps are required:
+
+```ts
+// src/types/next-auth.d.ts
+import type { DefaultSession, DefaultUser } from "next-auth";
+import type { DefaultJWT } from "next-auth/jwt";
+
+declare module "next-auth" {
+  interface User extends DefaultUser {
+    role?: string;
+  }
+  interface Session {
+    user: {
+      id: string;
+      role: string;
+    } & DefaultSession["user"];
+  }
+}
+
+declare module "next-auth/jwt" {
+  interface JWT extends DefaultJWT {
+    id?: string;
+    role?: string;
+  }
+}
+```
+
+## Role-Based Access Control (RBAC)
+
+### Define Roles and Permissions
+
+```ts
+// src/lib/permissions.ts
+export type Role = "free" | "pro" | "admin";
+
+const roleHierarchy: Record<Role, number> = {
+  free: 1,
+  pro: 2,
+  admin: 3,
+};
+
+export function hasRole(userRole: string | undefined, requiredRole: Role): boolean {
+  if (!userRole) return false;
+  return (roleHierarchy[userRole as Role] ?? 0) >= roleHierarchy[requiredRole];
+}
+```
+
+### Require Role in Server Components
+
+```ts
+import { auth } from "@/auth";
+import { redirect } from "next/navigation";
+import { hasRole } from "@/lib/permissions";
+
+export async function requireRole(role: Role) {
+  const session = await auth();
+  if (!session?.user) redirect("/login");
+  if (!hasRole(session.user.role, role)) redirect("/unauthorized");
+  return session;
+}
+
+// Usage in a page
+export default async function ProFeaturePage() {
+  const session = await requireRole("pro");
+  return <ProFeature user={session.user} />;
+}
+```
+
+### Feature Gating (Free vs Pro)
+
+```ts
+// src/lib/feature-flags.ts
+import type { Role } from "./permissions";
+
+const features = {
+  aiResumeGeneration: ["pro", "admin"],
+  unlimitedResumes: ["pro", "admin"],
+  exportPdf: ["free", "pro", "admin"],
+  customDomain: ["admin"],
+} as const satisfies Record<string, readonly Role[]>;
+
+export type Feature = keyof typeof features;
+
+export function canAccess(userRole: string | undefined, feature: Feature): boolean {
+  if (!userRole) return false;
+  return (features[feature] as readonly string[]).includes(userRole);
+}
+```
+
+## Session Strategy — JWT vs Database
+
+| Strategy | Pros | Cons | When to Use |
+|---|---|---|---|
+| `"jwt"` | No DB lookup per request, edge-compatible, stateless | Cannot revoke instantly, token size grows with claims | Default for Cloudflare/edge deployments |
+| `"database"` | Instant revocation, minimal token size | DB query per request, needs edge-compatible adapter | When instant session revocation is critical |
+
+**For Cloudflare D1 deployments, prefer JWT strategy.** Database sessions require a DB query on every request, adding latency. If you need revocation, implement a JWT blocklist in KV.
+
+```ts
+session: {
+  strategy: "jwt",
+  maxAge: 30 * 24 * 60 * 60, // 30 days
+},
+```
+
+## Provider Configuration Patterns
+
+### OAuth Providers
+
+```ts
+import Google from "next-auth/providers/google";
+import GitHub from "next-auth/providers/github";
+
+Google({
+  clientId: process.env.AUTH_GOOGLE_ID!,
+  clientSecret: process.env.AUTH_GOOGLE_SECRET!,
+  authorization: {
+    params: {
+      access_type: "offline",
+      prompt: "consent",
+    },
+  },
+}),
+```
+
+### Magic Link (Resend)
+
+```ts
+import Resend from "next-auth/providers/resend";
+
+Resend({
+  apiKey: process.env.AUTH_RESEND_KEY!,
+  from: "CVFairy <auth@cvfairy.com>",
+}),
+```
+
+### Credentials Provider (Use Sparingly)
+
+Credentials provider does NOT persist sessions to the DB adapter and requires manual security handling. Prefer OAuth or magic links:
+
+```ts
+import Credentials from "next-auth/providers/credentials";
+import { z } from "zod";
+import bcrypt from "bcryptjs";
+
+Credentials({
+  credentials: {
+    email: { label: "Email", type: "email" },
+    password: { label: "Password", type: "password" },
+  },
+  async authorize(credentials) {
+    const parsed = z.object({
+      email: z.string().email(),
+      password: z.string().min(8),
+    }).safeParse(credentials);
+
+    if (!parsed.success) return null;
+
+    const user = await db.select().from(users)
+      .where(eq(users.email, parsed.data.email))
+      .get();
+
+    if (!user?.passwordHash) return null;
+
+    const valid = await bcrypt.compare(parsed.data.password, user.passwordHash);
+    if (!valid) return null;
+
+    return { id: user.id, email: user.email, name: user.name, role: user.role };
+  },
+}),
+```
+
+## API Route Handlers
+
+```ts
+// src/app/api/auth/[...nextauth]/route.ts
+import { handlers } from "@/auth";
+
+const { GET, POST } = await handlers();
+export { GET, POST };
+```
+
+## Client-Side Session Access
+
+```tsx
+// In a Client Component
+"use client";
+import { useSession } from "next-auth/react";
+
+export function UserMenu() {
+  const { data: session, status } = useSession();
+
+  if (status === "loading") return <Skeleton />;
+  if (!session) return <LoginButton />;
+
+  return <div>{session.user.name}</div>;
+}
+```
+
+Wrap the app in `<SessionProvider>`:
+
+```tsx
+// src/app/layout.tsx
+import { SessionProvider } from "next-auth/react";
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html>
+      <body>
+        <SessionProvider>{children}</SessionProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+## Environment Variables
+
+```env
+# Required
+AUTH_SECRET=          # openssl rand -base64 33
+AUTH_URL=             # https://cvfairy.com (production URL)
+
+# OAuth — Google
+AUTH_GOOGLE_ID=
+AUTH_GOOGLE_SECRET=
+
+# OAuth — GitHub
+AUTH_GITHUB_ID=
+AUTH_GITHUB_SECRET=
+
+# Magic Link — Resend
+AUTH_RESEND_KEY=
+AUTH_EMAIL_FROM=
+
+# Cloudflare (for drizzle-kit migrations)
+CLOUDFLARE_ACCOUNT_ID=
+CLOUDFLARE_DATABASE_ID=
+CLOUDFLARE_D1_TOKEN=
+```
+
+For Cloudflare Workers, set secrets via `wrangler secret put AUTH_SECRET` (not in `wrangler.toml`).
+
+## Edge Runtime Compatibility
+
+### What Works at the Edge
+
+- JWT session strategy
+- OAuth providers (Google, GitHub, etc.)
+- `auth.config.ts` (no adapter)
+- Middleware route protection
+
+### What Does NOT Work at the Edge
+
+- Database adapters (Drizzle, Prisma) — require Node.js runtime
+- `bcrypt` — use `bcryptjs` instead
+- Node.js `crypto` — use Web Crypto API (`crypto.randomUUID()`, `crypto.subtle`)
+- Credentials provider `authorize()` with DB calls — keep in Node.js runtime
+
+### Runtime Declaration
+
+Mark route segments that use the DB adapter as Node.js runtime:
+
+```ts
+// src/app/api/auth/[...nextauth]/route.ts
+export const runtime = "nodejs"; // NOT "edge" — adapter needs Node.js
+```
+
+## Anti-Patterns — NEVER Do These
+
+1. **Never rely on middleware alone for auth.** Always call `auth()` in Server Components, Server Actions, and Route Handlers.
+2. **Never expose `user.id` to client-side code unnecessarily.** Only include it in server-side session checks.
+3. **Never put role checks only on the client.** Client-side checks are cosmetic. Server enforces.
+4. **Never import database adapters in `auth.config.ts`.** It runs at the edge.
+5. **Never skip the `jwt()` and `session()` callbacks.** Auth.js v5 silently drops custom fields without them.
+6. **Never use `getServerSession()` or `getToken()`.** Those are v4 patterns. Use `auth()` from your `auth.ts`.
+7. **Never store secrets in `wrangler.toml`.** Use `wrangler secret put` for AUTH_SECRET and OAuth credentials.
+8. **Never use `bcrypt`** in Workers/edge — use `bcryptjs` (pure JS implementation).
+9. **Never define inline Server Actions inside Client Components.** Place them in `src/server/actions/` with `"use server"`.
+10. **Never forget `trustHost: true`** for deployments behind a proxy (Cloudflare, Vercel).
+
+## File Structure
+
+```
+src/
+  auth.config.ts       # Edge-safe providers + authorized callback
+  auth.ts              # Full config with D1 adapter, jwt/session callbacks
+  middleware.ts         # Route-level auth gate
+  types/
+    next-auth.d.ts     # Module augmentation for Session, User, JWT
+  lib/
+    permissions.ts     # Role hierarchy + hasRole helper
+    feature-flags.ts   # Feature gating (free/pro/admin)
+  server/
+    actions/           # Server Actions with auth checks
+  app/
+    api/
+      auth/
+        [...nextauth]/
+          route.ts     # API route handlers
+      setup/
+        route.ts       # One-time D1 table setup
+    login/
+      page.tsx         # Sign-in page
+    dashboard/
+      page.tsx         # Protected page (calls auth())
+```
+
+## Callback Data Flow
+
+The data flow is linear and must not be broken:
+
+```
+authorize() / OAuth profile
+    → jwt({ token, user })     // Copy user.role → token.role on sign-in
+    → session({ session, token }) // Copy token.role → session.user.role on every request
+    → auth()                   // Returns session with role in Server Components
+```
+
+If you skip either callback, `role` will be `undefined` everywhere downstream. Auth.js v5 does NOT warn you — it silently omits the field.

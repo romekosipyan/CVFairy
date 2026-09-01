@@ -1,0 +1,700 @@
+---
+description: "Tailwind CSS v4 and shadcn/ui conventions: CSS-first theming, component composition, accessibility, and animation patterns for professional SaaS UI development"
+globs: ["**/*.tsx", "**/*.jsx", "**/*.css", "**/*.ts", "**/components/**", "**/app/**"]
+alwaysApply: false
+---
+
+# Tailwind CSS v4 + shadcn/ui — Agentic Coding Standards
+
+You are an expert in Tailwind CSS v4, shadcn/ui (2026), React 19, and accessible SaaS UI development.
+
+---
+
+## 1. Tailwind CSS v4 — CSS-First Architecture
+
+### Core Setup
+
+Tailwind v4 uses CSS-first configuration. There is NO `tailwind.config.js`. The CSS file IS the config.
+
+```css
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+```
+
+- `@import "tailwindcss"` replaces the three legacy `@tailwind` directives
+- `tw-animate-css` replaces `tailwindcss-animate` (the v3 PostCSS plugin is deprecated)
+- Dark mode is enabled via `@custom-variant dark (&:is(.dark *))` in CSS, NOT via `darkMode` in a JS config
+- Content detection is automatic — Tailwind crawls project files without explicit `content` paths
+- For Vite projects, use `@tailwindcss/vite` plugin; for others use `@tailwindcss/postcss`
+
+### What NOT To Do
+
+- NEVER create a `tailwind.config.js` or `tailwind.config.ts` — all config lives in CSS
+- NEVER use `@tailwind base/components/utilities` — use `@import "tailwindcss"` instead
+- NEVER use `tailwindcss-animate` — use `tw-animate-css`
+- NEVER put theme tokens in `@layer base` — that skips utility generation; use `@theme`
+- NEVER use `@apply` for new code — write utilities directly or use plain CSS in `@layer`
+- NEVER nest `@theme` under selectors or media queries — it hoists to `:root` regardless
+
+---
+
+## 2. Design Tokens and @theme
+
+### Token Definition with `@theme`
+
+Design tokens live in a `@theme` block in your entry CSS file. They become both `:root` CSS custom properties AND generated utility classes automatically.
+
+```css
+@theme {
+  --color-brand: oklch(0.62 0.19 256);
+  --font-display: "Cal Sans", "Inter", sans-serif;
+  --radius-card: 0.75rem;
+  --shadow-card: 0 1px 3px rgb(0 0 0 / 0.1);
+  --breakpoint-3xl: 1920px;
+}
+```
+
+The namespace prefix determines the generated utility:
+- `--color-*` → `bg-brand`, `text-brand`, `border-brand`
+- `--font-*` → `font-display`
+- `--spacing-*` → padding, margin, gap, size utilities
+- `--breakpoint-*` → responsive prefixes (`3xl:`)
+- `--radius-*` → `rounded-card`
+- `--shadow-*` → `shadow-card`
+
+### `@theme` vs `@theme inline`
+
+- **`@theme`** (default) — generates a CSS variable that participates in the cascade. Parent selectors CAN override it. **This is what you want for dark mode.**
+- **`@theme inline`** — bakes the resolved value into the utility at build time. The variable cascade is lost. **Dark mode BREAKS with `@theme inline` for color tokens.**
+
+Use `@theme inline` ONLY for computed values that must be resolved at build time (e.g., calc expressions for radius). Use plain `@theme` for anything that needs runtime switching.
+
+### Color Space: Use OKLCH
+
+Define colors in `oklch(lightness chroma hue)` instead of hex, rgb, or hsl. OKLCH is perceptually uniform — stepping lightness by a fixed amount produces visually consistent results across all hues.
+
+```css
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --border: oklch(0.922 0 0);
+}
+```
+
+Keep color scales short — 3-5 steps per hue, not a full 50-950 scale. Every `@theme` token generates utilities across bg/text/border/ring/outline families.
+
+---
+
+## 3. shadcn/ui Color System and Theming
+
+### Token Architecture
+
+shadcn/ui uses a two-layer token system with Tailwind v4:
+
+**Layer 1 — Semantic CSS variables** in `:root` and `.dark` (raw OKLCH values):
+```css
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+```
+
+**Layer 2 — `@theme inline` mapping** with `--color-` prefix so Tailwind generates utilities:
+```css
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+```
+
+### Dark Mode
+
+Define `.dark` with the SAME token names, different OKLCH values. Every token in `:root` MUST have a corresponding entry in `.dark` — a missing token is the #1 cause of broken dark mode.
+
+```css
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.145 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.145 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.396 0.141 25.723);
+  --border: oklch(0.269 0 0);
+  --input: oklch(0.269 0 0);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.145 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(0.269 0 0);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+```
+
+### Theming Rules
+
+- ALWAYS use semantic token classes: `bg-background`, `text-foreground`, `bg-primary`, `text-primary-foreground`, `text-muted-foreground`, `border-border`
+- NEVER use raw hex values (`bg-[#fff]`), arbitrary color values, or palette classes (`bg-zinc-900`)
+- NEVER hardcode `dark:` overrides on individual elements — theme switching flows through CSS variables
+- Adjust the palette by editing CSS variables in `:root`/`.dark`, not by sprinkling colors across components
+- Keep `cssVariables: true` in `components.json` — setting it to `false` breaks the semantic token model
+- Leave `tailwind.config` blank in `components.json` — there is no JS config to reference in v4
+
+---
+
+## 4. shadcn/ui Component Patterns
+
+### Distribution Model
+
+shadcn/ui is a CODE DISTRIBUTION system, not an npm dependency. The CLI copies component source into your project.
+
+- Install components: `npx shadcn@latest add <component-name>`
+- NEVER copy-paste components manually or import from a `@shadcn/ui` package
+- Components live in `components/ui/` — this directory is owned by the registry workflow
+- Use `new-york` style (the `default` style is deprecated)
+- Primitives import from the unified `radix-ui` package: `import { Dialog as DialogPrimitive } from "radix-ui"`
+- Before re-running `add` on an installed component, preview with `--dry-run` and `--diff`
+
+### CLI v4 Commands (2026)
+
+```bash
+npx shadcn@latest init              # Scaffold project, writes components.json
+npx shadcn@latest init --base radix # Choose Radix primitives (or --base base-ui)
+npx shadcn@latest add <name>        # Install a component
+npx shadcn@latest add <name> --dry-run --diff  # Preview changes before install
+npx shadcn@latest info              # Show framework, Tailwind version, installed components
+npx shadcn@latest info --json       # Machine-readable project context
+npx shadcn@latest docs <component>  # Fetch docs, composition trees, and examples
+npx shadcn@latest search <query>    # Search available components
+npx shadcn@latest skills generate   # Generate machine-readable skills file for AI agents
+npx shadcn@latest skills update     # Refresh skills after component changes
+npx shadcn@latest migrate radix     # Migrate to unified Radix package
+```
+
+### Component Composition
+
+Follow the composition tree — shadcn components have specific parent/child relationships:
+
+```
+Card
+├── CardHeader
+│   ├── CardTitle
+│   ├── CardDescription
+│   └── CardAction
+├── CardContent
+└── CardFooter
+```
+
+Rules:
+- Use `asChild` (Radix) or `render` (Base UI) for custom trigger elements — check `base` field via `npx shadcn@latest info`
+- Build feature components in `components/` that import and WRAP primitives from `components/ui/`
+- NEVER fork primitives by editing files in `components/ui/` directly — they drift from upstream a11y/security fixes
+- Route ALL class merging through the `cn()` helper (`clsx` + `tailwind-merge`). Never concatenate class strings manually
+- Do NOT strip Radix primitive props, `aria-*` attributes, `data-*` state hooks, or focus/keyboard handlers when wrapping
+
+### Icons
+
+- Pass icons as components: `icon={CheckIcon}`, not string keys
+- Use `data-icon` or `data-icon="inline"` on `Button` and similar components
+- NEVER add sizing classes (`size-4`, `w-4 h-4`) to icons inside shadcn components — they handle icon sizing via CSS
+
+### Forms
+
+- Validation uses `data-invalid` + `aria-invalid` on inputs
+- Use the compound `Form` components: `FormField`, `FormItem`, `FormLabel`, `FormControl`, `FormMessage`
+- Integrate with React Hook Form + Zod validation schemas
+
+---
+
+## 5. Styling Conventions
+
+### Utility Class Ordering
+
+Order classes consistently within elements:
+
+1. **Layout** — `relative`, `flex`, `grid`, `z-10`, `overflow-hidden`
+2. **Spacing** — `m-4`, `p-6`, `gap-4`
+3. **Sizing** — `w-full`, `h-64`, `min-h-screen`, `size-4`, `max-w-md`
+4. **Visual** — `bg-background`, `border`, `rounded-lg`, `shadow-sm`
+5. **Typography** — `text-sm`, `font-medium`, `leading-relaxed`, `text-foreground`
+6. **State/Interactive** — `hover:bg-accent`, `focus-visible:ring-2`, `disabled:opacity-50`
+7. **Responsive** — `sm:flex-row`, `md:grid-cols-2`, `lg:text-lg`
+8. **Animation** — `transition-colors`, `duration-200`, `animate-in`
+
+Use the `size-*` utility (added in v3.4, fully supported with `tailwind-merge` v3) instead of separate `w-* h-*`:
+```tsx
+// Correct
+<Icon className="size-4" />
+
+// Avoid
+<Icon className="w-4 h-4" />
+```
+
+### Class Merging
+
+ALWAYS use the `cn()` utility for conditional or composable classes:
+
+```tsx
+import { cn } from "@/lib/utils"
+
+function MyComponent({ className, variant }: Props) {
+  return (
+    <div className={cn(
+      "rounded-lg border bg-card p-6 text-card-foreground shadow-sm",
+      variant === "destructive" && "border-destructive/50 bg-destructive/10",
+      className
+    )} />
+  )
+}
+```
+
+### Responsive Design
+
+- Mobile-first: base styles apply to all sizes, add breakpoint prefixes for larger screens
+- Use responsive prefixes: `sm:`, `md:`, `lg:`, `xl:`, `2xl:`
+- Use `container` and `max-w-*` for layout width constraints
+- Prefer container queries (`@container`, `@sm:`, `@md:`) for component-level responsiveness
+- Apply responsive utilities to individual elements, not wrapper divs
+
+```tsx
+<div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+  {/* Cards */}
+</div>
+```
+
+---
+
+## 6. Animation Patterns
+
+### tw-animate-css (shadcn default)
+
+Enter/exit animations for dialogs, dropdowns, and accordions:
+
+```tsx
+// Enter
+<div className="animate-in fade-in zoom-in-95 duration-200">...</div>
+
+// Exit
+<div className="animate-out fade-out zoom-out-95 duration-150">...</div>
+
+// Slide patterns
+<div className="animate-in slide-in-from-top-2 fade-in duration-200">...</div>
+<div className="animate-in slide-in-from-bottom-4 fade-in duration-300">...</div>
+```
+
+Ready-to-use classes: `accordion-down`, `accordion-up`, `collapsible-down`, `collapsible-up`, `caret-blink`
+
+### Custom Animations via @theme
+
+Define custom animations in the CSS `@theme` block:
+
+```css
+@theme {
+  --animate-shimmer: shimmer 2s linear infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+```
+
+This generates `animate-shimmer` as a utility class.
+
+### Motion Library (framer-motion / motion)
+
+For complex orchestrated animations, use the `motion` library:
+
+```tsx
+import { motion } from "motion/react"
+
+<motion.div
+  initial={{ opacity: 0, y: 20 }}
+  animate={{ opacity: 1, y: 0 }}
+  exit={{ opacity: 0, y: -10 }}
+  transition={{ duration: 0.2, ease: "easeOut" }}
+>
+  {children}
+</motion.div>
+```
+
+### Performance Rules
+
+- Only animate `transform` and `opacity` for GPU-accelerated 60fps rendering
+- Avoid animating `width`, `height`, `top`, `left`, `margin`, `padding` — these trigger layout reflow
+- Use `will-change-transform` sparingly and only on elements that will actually animate
+
+---
+
+## 7. Accessibility
+
+### Focus Management
+
+```tsx
+// Keyboard-only focus ring (no ring on mouse click)
+<button className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:outline-none">
+
+// NEVER remove focus outlines
+// WRONG: focus:outline-none (without replacement)
+```
+
+### Reduced Motion
+
+ALWAYS respect `prefers-reduced-motion`:
+
+```tsx
+// Only animate when safe
+<div className="motion-safe:transition-transform motion-safe:duration-300 motion-safe:hover:-translate-y-1 motion-reduce:transition-none">
+
+// Loading spinner with text fallback
+<div className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
+<span className="sr-only motion-reduce:not-sr-only">Loading...</span>
+```
+
+Add a global safety net in your base CSS:
+
+```css
+@layer base {
+  @media (prefers-reduced-motion: reduce) {
+    *, ::before, ::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+```
+
+### High Contrast and Forced Colors
+
+```tsx
+// Adapt to contrast preferences
+<button className="border-border contrast-more:border-foreground">
+
+// Windows High Contrast Mode
+<div className="forced-colors:bg-[Highlight] forced-colors:text-[HighlightText]">
+```
+
+```css
+@media (forced-colors: active) {
+  :focus-visible {
+    outline-color: Highlight;
+  }
+}
+```
+
+### Color Contrast Requirements (WCAG 2.2)
+
+- Normal text: minimum 4.5:1 contrast ratio
+- Large text (18px+ bold, 24px+ regular): minimum 3:1
+- UI components and graphical objects: minimum 3:1
+- Verify `muted-foreground` meets 4.5:1 on card/muted backgrounds, not just white
+
+### Required ARIA Patterns
+
+- Icon-only buttons MUST have `aria-label` or contain `<span className="sr-only">`
+- All form inputs MUST have associated `<label>` elements or `aria-label`
+- Use semantic landmarks: `<header>`, `<main>`, `<nav>`, `<footer>`
+- Include skip-to-content link for keyboard navigation
+- Images must have `alt` text (empty `alt=""` for decorative images)
+- Use `aria-live="polite"` for dynamic content updates (toasts, status messages)
+
+---
+
+## 8. Component Architecture
+
+### File Organization
+
+```
+components/
+├── ui/               # shadcn primitives (registry-owned, do not edit)
+│   ├── button.tsx
+│   ├── card.tsx
+│   ├── dialog.tsx
+│   └── ...
+├── forms/            # Form-specific composed components
+│   ├── login-form.tsx
+│   └── settings-form.tsx
+├── layouts/          # Layout compositions
+│   ├── app-sidebar.tsx
+│   └── page-header.tsx
+└── features/         # Feature-specific compositions
+    ├── dashboard-card.tsx
+    └── user-avatar.tsx
+```
+
+### Component Conventions
+
+```tsx
+// Named exports only, no default exports
+export function DashboardCard({ title, children, className }: DashboardCardProps) {
+  return (
+    <Card className={cn("shadow-sm", className)}>
+      <CardHeader>
+        <CardTitle>{title}</CardTitle>
+      </CardHeader>
+      <CardContent>{children}</CardContent>
+    </Card>
+  )
+}
+```
+
+- Functional components with explicit return types when non-trivial
+- Props interface named `{ComponentName}Props`
+- ALWAYS accept and spread `className` for composability
+- Server Components by default; add `"use client"` only when interactivity is required
+- Keep components under 150 lines — extract sub-components when exceeding
+- No `React.forwardRef` in React 19 — `ref` is a regular prop
+
+### State Management Patterns
+
+- Server Components by default — move data fetching to the server
+- `"use client"` only for: event handlers, browser APIs, useState/useEffect, third-party client libs
+- Zustand for shared client state (not Redux, not Context API for complex state)
+- TanStack Query (useQuery/useMutation) for server state — never raw fetch in client components
+- React Hook Form + Zod for form state and validation
+
+---
+
+## 9. CSS Best Practices
+
+### Global Styles (`globals.css`)
+
+The complete structure of a Tailwind v4 + shadcn/ui globals.css:
+
+```css
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  /* Radius tokens */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* Color token mappings */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  /* ... all semantic tokens ... */
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  /* ... all light mode values ... */
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  /* ... all dark mode values ... */
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  html {
+    scrollbar-gutter: stable;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, ::before, ::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+  @media (forced-colors: active) {
+    :focus-visible {
+      outline-color: Highlight;
+    }
+  }
+}
+```
+
+### Referencing Tokens in Custom CSS
+
+Because `@theme` writes tokens to `:root` as CSS custom properties, custom CSS reads them directly:
+
+```css
+.prose blockquote {
+  border-left: 4px solid var(--border);
+  color: var(--muted-foreground);
+}
+```
+
+### What NOT To Do in CSS
+
+- NEVER define colors with `@theme inline` when they need dark mode switching
+- NEVER scatter arbitrary values (`bg-[#1a2b3c]`) — tokenize everything
+- NEVER remove focus styles with `:focus { outline: none }` — use `:focus-visible` for keyboard-only rings
+- NEVER use `@apply` in new code for simple class composition — write utilities directly
+- NEVER import `tailwindcss-animate` — use `tw-animate-css`
+- NEVER duplicate the `@tailwindcss/postcss` plugin with the `@tailwindcss/vite` plugin
+
+---
+
+## 10. shadcn/ui Project Configuration
+
+### `components.json` Key Settings
+
+```json
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "new-york",
+  "tailwind": {
+    "config": "",
+    "css": "src/app/globals.css",
+    "baseColor": "neutral",
+    "cssVariables": true
+  },
+  "aliases": {
+    "components": "@/components",
+    "ui": "@/components/ui",
+    "utils": "@/lib/utils",
+    "hooks": "@/hooks",
+    "lib": "@/lib"
+  }
+}
+```
+
+- `style`: always `"new-york"` (default is deprecated)
+- `tailwind.config`: leave empty string `""` for v4 (no JS config)
+- `cssVariables`: MUST be `true` — enables semantic token theming
+- `baseColor`: `"neutral"`, `"stone"`, `"zinc"`, `"mauve"`, `"olive"`, `"mist"`, or `"taupe"`
+
+### shadcn/skills Integration
+
+Generate the skills file for AI agent context:
+
+```bash
+npx shadcn@latest skills generate   # Creates .shadcn/skills.md
+npx shadcn@latest skills update     # Refresh after adding components
+npx shadcn@latest skills check      # Validate setup
+```
+
+Reference the skills file in your project's AI context (AGENTS.md, CLAUDE.md, or cursor rules).
+
+### MCP Server for Agent Workflows
+
+```bash
+npx shadcn@latest mcp init --client cursor
+```
+
+This enables agents to search, preview, and install components from natural language via the shadcn MCP server. Config lives in `.cursor/mcp.json`.
+
+---
+
+## Summary Checklist
+
+Before submitting any UI code, verify:
+
+- [ ] No `tailwind.config.js` — all config in CSS via `@theme`
+- [ ] Colors use OKLCH values in `:root` and `.dark`, mapped via `@theme inline` with `--color-` prefix
+- [ ] Every token in `:root` has a matching entry in `.dark`
+- [ ] Using `tw-animate-css`, not `tailwindcss-animate`
+- [ ] Dark mode enabled via `@custom-variant dark (&:is(.dark *))` in CSS
+- [ ] Semantic token classes only (`bg-background`, `text-primary`) — no hex/arbitrary/palette values
+- [ ] Components installed via `npx shadcn@latest add`, not copied manually
+- [ ] Feature components compose around primitives in `components/ui/` — never fork in place
+- [ ] All class merging uses the `cn()` helper
+- [ ] `focus-visible:` used for keyboard focus indicators
+- [ ] `motion-safe:`/`motion-reduce:` used for animations
+- [ ] Icon-only buttons have `aria-label` or `sr-only` text
+- [ ] Color contrast meets WCAG 2.2 AA ratios

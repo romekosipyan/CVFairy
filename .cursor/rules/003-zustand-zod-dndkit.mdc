@@ -1,0 +1,532 @@
+---
+description: "Zustand v5, Zod v4, and @dnd-kit best practices for state management, schema validation, and drag-and-drop in React/Next.js TypeScript projects"
+globs: ["src/lib/stores/**", "src/lib/schemas/**", "src/components/editor/**", "src/lib/hooks/**"]
+alwaysApply: false
+---
+
+# Zustand v5 + Zod v4 + @dnd-kit — Coding Standards
+
+## Zustand v5 State Management
+
+### Store Creation
+
+- Use `create<T>()()` (double parentheses / curried form) in TypeScript for correct middleware type inference
+- Define separate interfaces for state fields and actions; state first, then actions
+- Declare `create()` at module level — never inside a React component
+- Export the hook (`useXxxStore`), never the raw store object
+
+```typescript
+import { create } from 'zustand';
+
+interface CounterState {
+  count: number;
+}
+
+interface CounterActions {
+  increment: () => void;
+  reset: () => void;
+}
+
+type CounterStore = CounterState & CounterActions;
+
+const initialState: CounterState = { count: 0 };
+
+export const useCounterStore = create<CounterStore>()((set) => ({
+  ...initialState,
+  increment: () => set((state) => ({ count: state.count + 1 })),
+  reset: () => set(initialState),
+}));
+```
+
+### Slices Pattern
+
+Use slices for large apps. Each slice owns one domain; combine via spread in the root store.
+
+```typescript
+import { StateCreator } from 'zustand';
+
+type AppStore = AuthSlice & UISlice;
+type SliceCreator<T> = StateCreator<AppStore, [], [], T>;
+
+interface AuthSlice { user: User | null; login: (u: User) => void; logout: () => void; }
+
+const createAuthSlice: SliceCreator<AuthSlice> = (set) => ({
+  user: null,
+  login: (user) => set({ user }),
+  logout: () => set({ user: null }),
+});
+
+export const useAppStore = create<AppStore>()((...a) => ({
+  ...createAuthSlice(...a),
+  ...createUISlice(...a),
+}));
+```
+
+### Middleware Ordering
+
+Nest outer → inner: `devtools` → `subscribeWithSelector` → `persist` → `immer` → store definition.
+
+```typescript
+import { create } from 'zustand';
+import { devtools, persist, createJSONStorage } from 'zustand/middleware';
+import { immer } from 'zustand/middleware/immer';
+
+const useSettingsStore = create<SettingsStore>()(
+  devtools(
+    persist(
+      immer((set) => ({
+        ...initialState,
+        toggleDark: () => set((s) => { s.theme = s.theme === 'dark' ? 'light' : 'dark'; }),
+        reset: () => set(initialState),
+      })),
+      {
+        name: 'settings-storage',
+        storage: createJSONStorage(() => localStorage),
+        version: 1,
+        partialize: (state) => ({ theme: state.theme }),
+      }
+    ),
+    { name: 'SettingsStore', enabled: process.env.NODE_ENV === 'development' }
+  )
+);
+```
+
+### Immer Rules
+
+- Use immer only for stores with state nested ≥ 2 levels deep
+- Inside an immer `set()` callback, either mutate the draft OR return a new object — never both
+- Guard against null before mutating nested objects
+
+### Persist Rules
+
+- Always use `partialize` — never persist the entire store
+- Never persist loading flags, error messages, or transient UI state
+- Use explicit, unique `name` keys (`'auth-storage'`, not `'store'`)
+- Set `version` for future migrations
+
+### Selectors & Performance
+
+- Always use selectors: `useStore((s) => s.count)` — never destructure the full store
+- For multi-value selections use `useShallow`: `useStore(useShallow((s) => ({ a: s.a, b: s.b })))`
+- Never create new objects inside selectors without `useShallow` — causes infinite re-renders
+- Define selectors outside components for stable references
+- Actions are stable refs and safe to group in one selector
+
+### SSR / Next.js App Router Hydration
+
+- Client-only stores (theme, cart, UI): add `'use client'` to the consuming component — works as-is
+- For per-request isolation on the server: use a Provider + `createStore` factory pattern
+- Handle persist hydration mismatch with the `_hasHydrated` flag:
+
+```typescript
+const useStore = create<StoreWithHydration>()(
+  persist(
+    (set) => ({
+      count: 0,
+      _hasHydrated: false,
+      setHasHydrated: (h: boolean) => set({ _hasHydrated: h }),
+    }),
+    {
+      name: 'my-store',
+      onRehydrateStorage: () => (state) => { state?.setHasHydrated(true); },
+    }
+  )
+);
+```
+
+### Reset Pattern
+
+Every store must have a `reset()` action. Export a top-level `resetAllStores()` for logout/teardown.
+
+### Zustand Anti-Patterns
+
+| Never | Always |
+|---|---|
+| `create(...)` single parens in TS | `create<T>()()` double parens |
+| Mutate state directly: `state.count++` | Immutable updates or Immer |
+| `useStore((s) => ({ a: s.a }))` without shallow | `useShallow` for object selections |
+| Same persist `name` across stores | Unique storage key per store |
+| Access `localStorage` during SSR | Hydration flag pattern |
+| Zustand for server/async data | TanStack Query for server state |
+| Export raw store | Export the hook only |
+| Store creation inside components | Module-level `create()` |
+
+---
+
+## Zod v4 Schema Validation
+
+### Imports
+
+```typescript
+import { z } from 'zod/v4';
+```
+
+Always import from `zod/v4` (or root `zod` if the project is fully on v4).
+
+### Type Inference
+
+Every schema MUST have an inferred type. Place the type above the schema. Use the same name for both.
+
+```typescript
+export type User = z.infer<typeof User>;
+export const User = z.object({
+  id: z.string(),
+  email: z.email(),
+  name: z.string().min(1),
+  age: z.number().min(0).optional(),
+});
+```
+
+- Never use a `Schema` suffix — the schema IS the type
+- Always use JSDoc (`/** */`) for documentation, never `//`
+
+### String Validations — Top-Level Functions
+
+String format validations are standalone functions in v4 — method chaining is deprecated.
+
+```typescript
+z.email()        // not z.string().email()
+z.url()          // not z.string().url()
+z.uuid()         // not z.string().uuid()
+z.ip()           // → z.ipv4() or z.ipv6()
+z.cuid()
+z.ulid()
+```
+
+### Number Types
+
+- `z.number()` — general numbers (finite by default)
+- `z.int()` — integers (not `z.number().int()`)
+- `z.int32()`, `z.float32()`, `z.float64()` — specific numeric types
+
+### Object Types
+
+- `z.object()` — strips unknown keys (default)
+- `z.strictObject()` — rejects unknown keys (replaces `.strict()`)
+- `z.looseObject()` — passes through unknown keys (replaces `.passthrough()`)
+
+### Error Customization
+
+Use the unified `error` parameter. The old `message`, `required_error`, and `invalid_type_error` keys are removed.
+
+```typescript
+z.string({ error: 'Name is required' });
+z.email({ error: 'Please enter a valid email' });
+```
+
+Only override defaults when adding business-specific context — Zod's built-in messages are excellent.
+
+### Custom Validation — `.check()` over `.superRefine()`
+
+```typescript
+const Password = z.string().min(8).check(
+  (val) => /[A-Z]/.test(val) && /\d/.test(val),
+  { error: 'Must contain an uppercase letter and a number' }
+);
+```
+
+Migration from v3:
+- `val` → `ctx.value`
+- `ctx.addIssue()` → `ctx.issues.push()`
+- `z.ZodIssueCode.custom` → `'custom'`
+
+### Schema Composition
+
+```typescript
+const Base = z.object({ id: z.string(), createdAt: z.iso.datetime() });
+
+const UserCreate = Base.extend({ name: z.string(), email: z.email() });
+const UserPublic = UserCreate.pick({ id: true, name: true });
+const UserPartial = UserCreate.partial();
+
+// Combining two schemas — merge is deprecated
+const Combined = SchemaA.extend(SchemaB.shape);
+```
+
+### ISO Date Formats
+
+```typescript
+z.iso.date()      // "2026-09-01"
+z.iso.datetime()  // "2026-09-01T14:30:00Z"
+z.iso.time()      // "14:30:00"
+```
+
+### Functions
+
+```typescript
+const ProcessUser = z.function({
+  input: [UserCreate],
+  output: z.object({ id: z.string(), success: z.boolean() }),
+});
+```
+
+### Error Formatting
+
+```typescript
+const result = schema.safeParse(data);
+if (!result.success) {
+  console.log(z.prettifyError(result.error));  // human-readable
+  console.log(z.treeifyError(result.error));   // tree structure
+}
+```
+
+### Additional Features
+
+- Default: `.default()` applies to output; `.prefault()` for v3 behavior (applies to input)
+- File: `z.file().min(1024).max(5 * 1024 * 1024).mime(['image/jpeg'])`
+- Pipe: `z.pipe(z.string(), z.coerce.number())` for transformations
+- Async: `.check(async (val) => { ... })` for async validation
+- Template literals: `z.templateLiteral(z.literal('user_'), z.string())` for pattern strings
+
+### v3 → v4 Migration Quick Reference
+
+| v3 | v4 |
+|---|---|
+| `z.string().email()` | `z.email()` |
+| `{ message: "err" }` | `{ error: "err" }` |
+| `.strict()` | `z.strictObject()` |
+| `.passthrough()` | `z.looseObject()` |
+| `z.string().datetime()` | `z.iso.datetime()` |
+| `.args().returns()` | `{ input: [...], output: ... }` |
+| `.superRefine()` | `.check()` |
+| `ctx.addIssue()` | `ctx.issues.push()` |
+| `.merge(other)` | `.extend(other.shape)` |
+
+### Zod + Zustand Integration
+
+Infer store action parameter types from Zod schemas — never duplicate type definitions.
+
+```typescript
+export type CreateUserInput = z.infer<typeof CreateUserInput>;
+export const CreateUserInput = z.object({
+  name: z.string().min(1),
+  email: z.email(),
+});
+
+interface UserActions {
+  createUser: (input: CreateUserInput) => Promise<void>;
+}
+```
+
+---
+
+## @dnd-kit Drag and Drop
+
+### Package Setup (New API)
+
+Use the new `@dnd-kit/react` and `@dnd-kit/helpers` packages. The legacy `@dnd-kit/core` + `@dnd-kit/sortable` packages are replaced.
+
+```json
+{
+  "@dnd-kit/react": "^1.x",
+  "@dnd-kit/helpers": "^1.x",
+  "@dnd-kit/collision": "^1.x"
+}
+```
+
+### Provider
+
+Use `DragDropProvider` — it replaces the legacy `DndContext`. No `SortableContext` is needed.
+
+```tsx
+import { DragDropProvider } from '@dnd-kit/react';
+
+function App() {
+  return (
+    <DragDropProvider
+      onDragEnd={(event) => { /* handle drop */ }}
+    >
+      {children}
+    </DragDropProvider>
+  );
+}
+```
+
+### Sortable Lists
+
+Use `useSortable` with `id` and `index`. The `OptimisticSortingPlugin` handles visual reordering during drag automatically.
+
+```tsx
+import { useSortable, isSortable } from '@dnd-kit/react/sortable';
+import { directionBiased } from '@dnd-kit/collision';
+import { memo } from 'react';
+
+const SortableItem = memo(function SortableItem({ id, index }: { id: string; index: number }) {
+  const { ref, isDragging } = useSortable({
+    id,
+    index,
+    collisionDetector: directionBiased,
+  });
+
+  return (
+    <div ref={ref} style={{ opacity: isDragging ? 0.5 : 1 }}>
+      {id}
+    </div>
+  );
+});
+```
+
+### State Management on Drag End
+
+Use `isSortable` type guard. Compare `initialIndex`/`index` and `initialGroup`/`group`.
+
+```tsx
+<DragDropProvider
+  onDragEnd={(event) => {
+    if (event.canceled) return;
+    const { source } = event.operation;
+    if (isSortable(source)) {
+      setItems((items) => move(items, event));
+    }
+  }}
+>
+```
+
+Or manual state management for full control:
+
+```tsx
+onDragEnd={(event) => {
+  if (event.canceled) return;
+  const { source } = event.operation;
+  if (isSortable(source)) {
+    const { initialIndex, index, initialGroup, group } = source;
+    if (initialGroup === group) {
+      // Reorder within same list
+    } else {
+      // Cross-list transfer
+    }
+  }
+}}
+```
+
+### Multi-List / Kanban
+
+Use `group`, `type`, and `accept` to control which items can be sorted where:
+
+```tsx
+const { ref } = useSortable({
+  id: item.id,
+  index,
+  group: columnId,
+  type: 'card',
+  accept: 'card',
+});
+```
+
+### Drag Overlay
+
+- Never render a component that uses `useSortable` or `useDraggable` inside the drag overlay — causes ID collisions
+- Create a separate presentational component for the overlay
+- Use ref forwarding or wrapper node pattern
+
+### Accessibility — Non-Negotiable
+
+- Always register BOTH `PointerSensor` and `KeyboardSensor`
+- Draggable activator elements MUST be focusable (`<button>`, `<a>`, or `tabIndex={0}`)
+- Provide `aria-label` or `aria-describedby` on draggable handles
+- Use `sortableKeyboardCoordinates` for sortable keyboard navigation
+- Respect reduced motion (handled automatically by the Feedback plugin)
+- Custom screen reader announcements via `announcements` prop
+
+### Sensors
+
+```tsx
+import { PointerSensor, KeyboardSensor } from '@dnd-kit/react';
+
+<DragDropProvider
+  sensors={(defaults) => [
+    ...defaults,
+    PointerSensor.configure({ activationConstraint: { distance: 8 } }),
+    KeyboardSensor.configure({ offset: 25 }),
+  ]}
+>
+```
+
+- Touch: use 250–400ms activation delay to distinguish from scrolling
+- Pointer: use `distance: 8` to prevent accidental drags on click
+
+### Collision Detection
+
+- `directionBiased` — optimized for sortable lists (recommended default)
+- `closestCenter` — forgiving, good for general sortable lists
+- `closestCorners` — good for grid layouts
+- `rectIntersection` — precise, default for non-sortable
+- `pointerWithin` — high-precision, pointer must be inside droppable
+- Compose algorithms for mixed interfaces (e.g., sortable list + trash zone)
+
+### Animation & Performance
+
+- `useSortable` returns `isDragging` and `isDropping` for styling transitions
+- Wrap sortable items in `memo()` to prevent unnecessary re-renders
+- For large lists (100+ items), consider virtualization
+- Disable transitions for items that are not actively involved in the drag
+
+### Integration with External State (React Query, Zustand)
+
+When using sortable lists with data fetching:
+- Maintain a local `items` state; render from it, not directly from query data
+- Only sync fetched data into local state when no drag is in progress
+- Snapshot state on `onDragStart`, revert on cancel
+
+### dnd-kit Anti-Patterns
+
+| Never | Always |
+|---|---|
+| Use `useSortable` inside drag overlay | Render a presentational component |
+| Duplicate IDs across one `DragDropProvider` | Unique IDs for all items |
+| Skip `KeyboardSensor` | Register both Pointer + Keyboard sensors |
+| Non-focusable drag handles (`<div>`) | `<button>` or `tabIndex={0}` |
+| Use legacy `DndContext` / `SortableContext` | `DragDropProvider` + `useSortable` |
+| Compare `source.id === target.id` with optimistic sorting | Use `initialIndex` / `index` / `group` |
+
+---
+
+## Cross-Library Patterns
+
+### Zustand + Zod: Schema-Driven Stores
+
+```typescript
+export type TodoItem = z.infer<typeof TodoItem>;
+export const TodoItem = z.object({
+  id: z.string(),
+  title: z.string().min(1),
+  completed: z.boolean(),
+  order: z.int().min(0),
+});
+
+interface TodoStore {
+  items: TodoItem[];
+  addTodo: (input: Omit<TodoItem, 'id' | 'order'>) => void;
+  reorder: (fromIndex: number, toIndex: number) => void;
+}
+```
+
+### Zustand + dnd-kit: Drag-Reorder State
+
+```typescript
+import { move } from '@dnd-kit/helpers';
+
+const useBoardStore = create<BoardStore>()(
+  immer((set) => ({
+    columns: {},
+    reorderCards: (event: DragEndEvent) => {
+      set((state) => {
+        state.columns = move(state.columns, event);
+      });
+    },
+  }))
+);
+```
+
+### Zod + dnd-kit: Validate Drops
+
+```typescript
+const DropTarget = z.object({
+  accepts: z.array(z.enum(['card', 'task', 'file'])),
+  maxItems: z.int().min(1),
+});
+
+function canDrop(target: z.infer<typeof DropTarget>, itemType: string): boolean {
+  return target.accepts.includes(itemType as any);
+}
+```

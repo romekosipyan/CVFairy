@@ -1,0 +1,216 @@
+---
+description: "Rules for @react-pdf/renderer — PDF document generation, templates, fonts, styling, and performance"
+globs: ["src/lib/export/**/*.{ts,tsx}", "src/templates/**/*.{ts,tsx}", "src/components/resume/**/*.tsx"]
+alwaysApply: false
+---
+
+# @react-pdf/renderer — PDF Generation Rules
+
+## Package Distinction
+- `@react-pdf/renderer` = **creates** PDFs from React components (this project)
+- `react-pdf` (wojtekmaj) = **displays** existing PDFs with PDF.js (used for live preview)
+- Never confuse them — they have different APIs, different imports, different purposes
+
+## Component Hierarchy
+
+```
+<Document>           ← Root: metadata (title, author, subject, keywords)
+  <Page>             ← size="A4" | "LETTER" | {width, height}
+    <View>           ← Container (like div). Flexbox only — no CSS Grid
+      <Text>         ← All text MUST be inside <Text>. Supports nesting for inline styles
+      <Image>        ← JPG, PNG, base64. Use cache={true} for remote images
+      <Link>         ← Hyperlinks (external URLs or internal anchors)
+      <Svg>          ← Vector graphics: <Circle>, <Rect>, <Path>, <Line>, <G>
+      <Canvas>       ← Freeform drawing with pdfkit methods
+    </View>
+  </Page>
+</Document>
+```
+
+### Critical Component Rules
+- **All raw text MUST be wrapped in `<Text>`** — bare strings inside `<View>` cause layout crashes
+- **No `<div>`, `<span>`, `<p>`, or HTML elements** — only react-pdf primitives
+- **No CSS Grid** — only Flexbox is supported
+- **No `display: inline` or `display: block`** — use `flexDirection: "row"` for inline-like layouts
+- **SVG numeric values must be numbers, not strings** — `x={10}` not `x="10"` inside render props
+
+## StyleSheet System
+
+Always use `StyleSheet.create()` — it caches styles and improves performance:
+
+```tsx
+const styles = StyleSheet.create({
+  page: {
+    padding: 30,
+    fontFamily: "Roboto",
+    fontSize: 11,
+    color: "#333333",
+  },
+  section: {
+    marginBottom: 10,
+    flexDirection: "column",
+  },
+  row: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+});
+```
+
+### Supported CSS Properties
+- **Flexbox**: flexDirection, justifyContent, alignItems, alignSelf, flex, flexWrap, flexGrow, flexShrink, flexBasis, gap, rowGap, columnGap
+- **Sizing**: width, height, minWidth, minHeight, maxWidth, maxHeight
+- **Spacing**: margin, marginHorizontal, marginVertical, padding, paddingHorizontal, paddingVertical (and all directional variants)
+- **Typography**: fontSize, fontFamily, fontStyle, fontWeight, letterSpacing, lineHeight, textAlign, textDecoration, textTransform, textOverflow, maxLines, textIndent
+- **Visual**: backgroundColor, color, opacity, border (all variants), borderRadius (all corners)
+- **Position**: position ("absolute" | "relative"), top, right, bottom, left, zIndex
+- **Media queries**: query based on width, height, orientation of the document
+
+### Properties NOT Supported
+- `display: grid`, `display: inline`, `display: block`
+- `float`, `clear`
+- CSS variables (`var(--x)`)
+- `transform`, `transition`, `animation`
+- `box-shadow`, `text-shadow`
+- `overflow: scroll`
+
+## Font Registration
+
+```tsx
+import { Font } from "@react-pdf/renderer";
+
+Font.register({
+  family: "Roboto",
+  fonts: [
+    { src: "/fonts/Roboto-Regular.ttf", fontWeight: 400 },
+    { src: "/fonts/Roboto-Medium.ttf", fontWeight: 500 },
+    { src: "/fonts/Roboto-Bold.ttf", fontWeight: 700 },
+    { src: "/fonts/Roboto-Italic.ttf", fontWeight: 400, fontStyle: "italic" },
+    { src: "/fonts/Roboto-BoldItalic.ttf", fontWeight: 700, fontStyle: "italic" },
+  ],
+});
+
+Font.registerHyphenationCallback((word) => [word]);
+```
+
+### Font Rules
+- **Only TTF and WOFF** are supported — no OTF, no WOFF2, no variable fonts
+- **Always use numeric fontWeight** (400, 700) — string values ("normal", "bold") can cause resolution errors
+- **Always call `Font.registerHyphenationCallback((word) => [word])`** to prevent crashes with custom fonts
+- **Store fonts in `/public/fonts/`** for Vite/Next.js — import or use public path, not node_modules
+- **Register fonts once** at module level, outside components — not inside render functions
+- **In Next.js server components**: use `process.cwd() + "/public/fonts/..."` for absolute paths
+
+## Page Breaks and Wrapping
+
+```tsx
+<View break />                                    // Force page break before this view
+<View wrap={false}>                                // Keep entire view on one page
+  <Text>This content stays together</Text>
+</View>
+<Text orphans={2} widows={2}>Long text...</Text>   // Orphan/widow control
+<View minPresenceAhead={100}>                      // Require 100pt of space ahead
+  <Text>Content needs space below</Text>
+</View>
+```
+
+## Fixed Headers and Footers
+
+```tsx
+<Page size="A4" style={{ padding: 30, paddingTop: 60, paddingBottom: 50 }}>
+  <View fixed style={{ position: "absolute", top: 20, left: 30, right: 30 }}>
+    <Text style={{ fontSize: 8, color: "#999" }}>Resume — John Doe</Text>
+  </View>
+
+  {/* Main content with margins to avoid overlap */}
+  <View style={{ flex: 1 }}>
+    <Text>Page content here</Text>
+  </View>
+
+  <Text
+    fixed
+    style={{ position: "absolute", bottom: 20, left: 30, right: 30, textAlign: "center", fontSize: 8 }}
+    render={({ pageNumber, totalPages }) => `${pageNumber} / ${totalPages}`}
+  />
+</Page>
+```
+
+## Dynamic Content and Render Props
+
+The `render` prop on `<Text>` and `<View>` provides page context:
+
+```tsx
+<Text render={({ pageNumber, totalPages }) => `Page ${pageNumber} of ${totalPages}`} />
+```
+
+**Warning**: `render` executes twice — once during layout, once after page count is known. Do not put expensive operations in render props.
+
+## Conditional Rendering
+
+```tsx
+// CORRECT — force boolean conversion to avoid empty string nodes
+{!!name && <Text>{name}</Text>}
+{items.length > 0 && <View>...</View>}
+
+// WRONG — empty string "" is falsy but still creates a node that crashes layout
+{name && <Text>{name}</Text>}
+```
+
+Always use `!!variable` or explicit comparison (`variable !== ""`) in conditional rendering to prevent the empty-string layout crash.
+
+## Template Pattern for Resumes
+
+Structure reusable PDF components as pure functions:
+
+```tsx
+// src/templates/components/SectionHeader.tsx
+import { Text, View, StyleSheet } from "@react-pdf/renderer";
+
+const styles = StyleSheet.create({
+  container: { marginBottom: 8, borderBottomWidth: 1, borderBottomColor: "#2563eb", paddingBottom: 4 },
+  title: { fontSize: 14, fontWeight: 700, color: "#1e293b", textTransform: "uppercase" },
+});
+
+interface SectionHeaderProps {
+  title: string;
+}
+
+export function SectionHeader({ title }: SectionHeaderProps) {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>{title}</Text>
+    </View>
+  );
+}
+```
+
+### Template Architecture
+- Keep template components in `src/templates/` as pure React components
+- Each template is a function: `(resumeData: ResumeData) => JSX.Element` (returns a `<Document>`)
+- Share common sub-components (SectionHeader, BulletList, SkillBadge) across templates
+- Define theme tokens (colors, spacing, fontSizes) as a config object, not hardcoded
+- Never put side effects or hooks in PDF template components
+
+## Performance
+
+- **Use `StyleSheet.create()`** — plain objects skip caching
+- **Compress images** before embedding — large images bloat the PDF
+- **Use `cache={true}`** on `<Image>` for remote sources
+- **Use `renderToStream()`** on the server for large documents instead of `renderToBuffer()`
+- **Debounce updates** when using `usePDF()` — rapid re-renders create memory pressure; revoke old blob URLs with `URL.revokeObjectURL()` in cleanup
+- **Subset fonts** — use only the weights/styles you need; full font families add hundreds of KB
+
+## Live Preview Architecture
+
+For the editor live preview, use the double-buffer pattern:
+1. `usePDF()` generates a blob URL from the `<Document>` component
+2. Pass that blob URL to `react-pdf` (wojtekmaj) `<Document file={url}>` for canvas rendering
+3. Use a `currentUrlRef` token to prevent stale renders from overwriting newer ones
+4. Always `URL.revokeObjectURL(oldUrl)` in the useEffect cleanup to prevent memory leaks
+5. Debounce document updates (300-500ms) to avoid excessive re-renders
+
+## Debugging
+- Use `debug={true}` on any component to visualize its bounding box
+- Check the console for font loading errors — they're often silent failures
+- Test page breaks with realistic content lengths — layout behaves differently than web CSS

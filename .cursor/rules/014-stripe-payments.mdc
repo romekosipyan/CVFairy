@@ -1,0 +1,311 @@
+---
+description: "Stripe payment integration: checkout sessions, subscriptions, one-time payments, webhooks, customer portal, metered billing, edge runtime, and free tier management"
+globs: ["**/stripe/**", "**/payments/**", "**/billing/**", "**/webhooks/**", "**/api/stripe/**", "**/lib/stripe*", "**/pricing/**", "**/subscription*"]
+alwaysApply: false
+---
+
+# Stripe Payment Integration Rules
+
+## SDK & Configuration
+
+- Use the official `stripe` npm package — never raw HTTP calls
+- Pin the API version explicitly: `apiVersion: '2026-03-25.dahlia'` (or latest stable)
+- Store `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` in environment variables only
+- Use `sk_test_` keys during development; never commit live keys
+- Initialize Stripe once in a shared module (`lib/stripe.ts`), export the instance
+
+```typescript
+// lib/stripe.ts
+import Stripe from 'stripe';
+
+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: '2026-03-25.dahlia',
+  typescript: true,
+});
+```
+
+## Edge Runtime / Cloudflare Workers Compatibility
+
+When deploying to edge runtimes (Cloudflare Workers, Vercel Edge, Deno):
+
+- MUST use `Stripe.createFetchHttpClient()` — the default `NodeHttpClient` hangs in V8 isolates
+- MUST use `constructEventAsync` with `Stripe.createSubtleCryptoProvider()` for webhook verification
+- The synchronous `constructEvent` will throw `CryptoProviderOnlySupportsAsyncError` in edge runtimes
+
+```typescript
+// lib/stripe.edge.ts — for edge/worker environments
+import Stripe from 'stripe';
+
+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: '2026-03-25.dahlia',
+  httpClient: Stripe.createFetchHttpClient(),
+});
+
+export const webhookCryptoProvider = Stripe.createSubtleCryptoProvider();
+```
+
+## Checkout Sessions
+
+### Subscriptions (recurring)
+- Set `mode: 'subscription'` when at least one line item has a recurring price
+- Pass all Price IDs in the `line_items` array (max 20 recurring + 20 one-time)
+- One-time items in subscription mode are charged on the initial invoice only
+- Always set `success_url` and `cancel_url` with `{CHECKOUT_SESSION_ID}` template variable
+- Use `customer` param if user already has a Stripe customer ID; use `customer_email` for new users
+
+### One-time Payments
+- Set `mode: 'payment'` for single purchases
+- Create `PaymentIntent` server-side, never client-side
+
+### Mixed Cart (subscription + one-time add-ons)
+- Use `mode: 'subscription'` and include both recurring and one-time price IDs in `line_items`
+
+```typescript
+// Example: create checkout session
+const session = await stripe.checkout.sessions.create({
+  mode: 'subscription',
+  customer: existingCustomerId ?? undefined,
+  customer_email: existingCustomerId ? undefined : userEmail,
+  line_items: [
+    { price: priceId, quantity: 1 },
+  ],
+  success_url: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+  cancel_url: `${baseUrl}/pricing`,
+  subscription_data: {
+    metadata: { userId },
+  },
+  allow_promotion_codes: true,
+});
+```
+
+## Price Configuration
+
+### Tier Structure
+- Define Products in Stripe Dashboard or via API, one per logical plan
+- Create Prices for each billing interval: `month`, `year`, and optionally a one-time `lifetime` price
+- Use `lookup_key` on prices for stable code references (e.g., `pro_monthly`, `pro_annual`)
+- Annual pricing: offer 16–20% discount vs monthly to increase LTV
+- Lifetime: use `mode: 'payment'` with a one-time price, not a subscription
+
+### Example Tier Map
+```typescript
+// config/pricing.ts
+export const PLANS = {
+  free: { stripePriceId: null, limits: { projects: 3, storage: 100 } },
+  pro: {
+    monthly: { stripePriceId: 'price_xxx', amount: 1900 },
+    annual:  { stripePriceId: 'price_yyy', amount: 15900 },
+  },
+  business: {
+    monthly: { stripePriceId: 'price_aaa', amount: 4900 },
+    annual:  { stripePriceId: 'price_bbb', amount: 41900 },
+  },
+} as const;
+```
+
+## Free Tier Management
+
+- Do NOT create a Stripe Customer or Subscription for free-tier users
+- Store plan status in your database: `plan: 'free'` flag on the user/org record
+- Enforce free-tier limits in your application logic, not via Stripe
+- Stripe only enters the picture when a user upgrades to a paid plan
+- On upgrade: create Stripe Customer → create Checkout Session → sync via webhooks
+
+### Entitlement Pattern
+```typescript
+// lib/entitlements.ts
+type Plan = 'free' | 'pro' | 'business';
+
+const ENTITLEMENTS: Record<Plan, Record<string, number | boolean>> = {
+  free:     { maxProjects: 3, maxStorage: 100, analytics: false },
+  pro:      { maxProjects: 50, maxStorage: 5000, analytics: true },
+  business: { maxProjects: -1, maxStorage: -1, analytics: true },
+};
+
+export function canAccess(plan: Plan, feature: string): boolean {
+  return !!ENTITLEMENTS[plan]?.[feature];
+}
+
+export function getLimit(plan: Plan, feature: string): number {
+  return (ENTITLEMENTS[plan]?.[feature] as number) ?? 0;
+}
+```
+
+## Customer Portal
+
+- Use the Stripe-hosted Customer Portal for subscription management — saves weeks of UI work
+- Configure in Dashboard: enable "Switch plan", "Update quantities", "Cancel subscription"
+- Enable proration for plan switches; configure downgrades to apply at end of billing period
+- Generate portal sessions server-side:
+
+```typescript
+const portalSession = await stripe.billingPortal.sessions.create({
+  customer: stripeCustomerId,
+  return_url: `${baseUrl}/billing`,
+});
+// Redirect user to portalSession.url
+```
+
+## Upgrade / Downgrade Flows
+
+- NEVER cancel-and-recreate subscriptions to change plans — use `stripe.subscriptions.update()`
+- For upgrades: use `proration_behavior: 'always_invoice'` to charge immediately
+- For downgrades: use `proration_behavior: 'create_prorations'` or schedule at period end
+- Always preview proration before executing: `stripe.invoices.createPreview()`
+- When switching monthly ↔ annual: decide on `billing_cycle_anchor: 'now'` vs `'unchanged'`
+
+```typescript
+async function changePlan(subscriptionId: string, newPriceId: string, isUpgrade: boolean) {
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const currentItemId = subscription.items.data[0].id;
+
+  return stripe.subscriptions.update(subscriptionId, {
+    items: [{ id: currentItemId, price: newPriceId }],
+    proration_behavior: isUpgrade ? 'always_invoice' : 'create_prorations',
+  });
+}
+```
+
+## Webhook Handling
+
+### Security
+- ALWAYS verify webhook signatures — no exceptions, even in development
+- Endpoint path: `/api/stripe/webhooks` (or `/api/webhooks/stripe`)
+- Read the raw request body (not parsed JSON) for signature verification
+- Return `200` immediately; process business logic asynchronously for long operations
+
+### Idempotency
+- Store processed `event.id` values in a `stripe_events` table with a unique constraint
+- Check for duplicates before processing — Stripe may deliver the same event multiple times
+- Use Redis with 24h TTL for high-throughput idempotency checks (covers Stripe's 12h retry window)
+
+### Edge Runtime Webhook Handler
+```typescript
+// app/api/stripe/webhooks/route.ts
+import { stripe, webhookCryptoProvider } from '@/lib/stripe.edge';
+
+export const runtime = 'edge';
+
+export async function POST(request: Request) {
+  const body = await request.text();
+  const signature = request.headers.get('stripe-signature')!;
+
+  const event = await stripe.webhooks.constructEventAsync(
+    body,
+    signature,
+    process.env.STRIPE_WEBHOOK_SECRET!,
+    undefined,
+    webhookCryptoProvider,
+  );
+
+  // Idempotency check
+  const existing = await db.stripeEvent.findUnique({ where: { eventId: event.id } });
+  if (existing) return new Response('Already processed', { status: 200 });
+  await db.stripeEvent.create({ data: { eventId: event.id, type: event.type } });
+
+  switch (event.type) {
+    case 'checkout.session.completed':
+      await handleCheckoutComplete(event.data.object);
+      break;
+    case 'customer.subscription.updated':
+      await handleSubscriptionUpdate(event.data.object);
+      break;
+    case 'customer.subscription.deleted':
+      await handleSubscriptionCanceled(event.data.object);
+      break;
+    case 'invoice.payment_failed':
+      await handlePaymentFailed(event.data.object);
+      break;
+  }
+
+  return new Response('OK', { status: 200 });
+}
+```
+
+### Node.js Runtime Webhook Handler
+```typescript
+// For standard Node.js runtime (not edge)
+import { stripe } from '@/lib/stripe';
+
+export async function POST(request: Request) {
+  const body = await request.text();
+  const signature = request.headers.get('stripe-signature')!;
+
+  const event = stripe.webhooks.constructEvent(
+    body,
+    signature,
+    process.env.STRIPE_WEBHOOK_SECRET!,
+  );
+  // ... same event handling as above
+}
+```
+
+### Essential Webhook Events
+| Event | Action |
+|---|---|
+| `checkout.session.completed` | Provision access, store customer/subscription IDs |
+| `customer.subscription.created` | Sync plan to database |
+| `customer.subscription.updated` | Handle plan changes, status transitions |
+| `customer.subscription.deleted` | Revoke paid access, revert to free tier |
+| `invoice.payment_failed` | Notify user, start dunning flow |
+| `invoice.paid` | Confirm payment, extend access |
+| `customer.subscription.trial_will_end` | Send trial-ending notification (3 days before) |
+
+## Metered / Usage-Based Billing
+
+### For New Integrations (2026)
+- Stripe recommends **Metronome** for all new usage-based billing implementations
+- Metronome handles: event ingestion, metering, rating, invoice generation, prepaid credits, enterprise contracts
+
+### For Existing Billing Meters
+- Send meter events with a deterministic `identifier` for idempotency
+- Stripe aggregates usage server-side — do not aggregate yourself
+- Track usage in a separate ledger table in your database for auditability
+
+```typescript
+// Report usage event to Stripe Billing Meters
+await stripe.billing.meterEvents.create({
+  event_name: 'api_calls',
+  payload: {
+    stripe_customer_id: customerId,
+    value: '1',
+  },
+  identifier: `${customerId}_${requestId}`, // idempotency
+});
+```
+
+## Data Architecture
+
+- Store `stripeCustomerId` and `stripeSubscriptionId` on your user/org record
+- Keep billing and subscription tables separate — they serve different query patterns
+- Never store card numbers, CVVs, or full payment details anywhere in your system
+- Subscription status should be a Zod discriminated union, not a simple enum
+- Your database is the source of truth for entitlements; webhooks keep it in sync
+
+## Validation & Type Safety
+
+- Validate all webhook payloads with Zod schemas
+- Use TypeScript strict mode with Stripe's built-in types
+- Never trust client-side subscription status or price calculations — always verify server-side
+- Validate `price_id` values against your known set before creating checkout sessions
+
+## Anti-Patterns — NEVER Do These
+
+- Do NOT build custom card input forms — use Stripe Checkout or Payment Elements
+- Do NOT store card numbers or CVVs anywhere in your system
+- Do NOT skip webhook signature verification, even in development
+- Do NOT rely on client-side subscription status — always verify server-side
+- Do NOT cancel and recreate subscriptions for plan changes — use subscription update
+- Do NOT make direct Stripe API calls from React Server Components — centralize in `lib/stripe`
+- Do NOT create Stripe customers for free-tier users
+- Do NOT expose `STRIPE_SECRET_KEY` or raw webhook payloads to the client
+- Do NOT use synchronous `constructEvent` in edge runtimes
+
+## Testing
+
+- Always test with Stripe test mode keys (`sk_test_`, `pk_test_`)
+- Use Stripe CLI (`stripe listen --forward-to`) for local webhook testing
+- Use Stripe test clocks for simulating billing cycle progression
+- Test these flows: signup → checkout → webhook → access provisioned
+- Test payment failure → dunning → recovery and cancellation → free tier revert
+- Use Stripe's test card numbers: `4242424242424242` (success), `4000000000000002` (decline)

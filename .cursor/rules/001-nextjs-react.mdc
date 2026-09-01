@@ -1,0 +1,678 @@
+---
+description: "Next.js 16 App Router + React 19 full-stack SaaS conventions: server/client components, Cache Components, Server Actions, TypeScript strict, Cloudflare Workers deployment via OpenNext"
+globs: ["src/app/**/*.tsx", "src/app/**/*.ts", "src/components/**/*.tsx", "src/components/**/*.ts", "src/lib/**/*.ts", "src/actions/**/*.ts"]
+alwaysApply: false
+---
+
+# Next.js 16 + React 19 — Full-Stack SaaS Rules
+
+## Stack Declaration
+
+- Next.js 16 (App Router only — no Pages Router)
+- React 19
+- TypeScript 5.x (strict mode, `"strict": true` in tsconfig)
+- Tailwind CSS 4 with `cn()` utility from `@/lib/utils`
+- Turbopack (default bundler in Next.js 16)
+- Deployment target: Cloudflare Workers via `@opennextjs/cloudflare`
+
+## File Structure Conventions
+
+```
+app/
+├── layout.tsx              # Root layout (required) — must render <html> and <body>
+├── page.tsx                # Home route (/)
+├── loading.tsx             # Root loading UI (auto Suspense boundary)
+├── error.tsx               # Root error boundary ("use client" required)
+├── not-found.tsx           # Root 404 UI
+├── global-error.tsx        # Catches errors in root layout ("use client", must render <html>/<body>)
+├── (marketing)/            # Route group — no URL impact
+│   ├── layout.tsx
+│   ├── page.tsx            # Route: /
+│   └── about/page.tsx      # Route: /about
+├── (app)/                  # Authenticated app route group
+│   ├── layout.tsx          # App shell with auth check
+│   ├── dashboard/
+│   │   ├── page.tsx        # Route: /dashboard
+│   │   ├── loading.tsx
+│   │   └── error.tsx
+│   └── settings/
+│       └── page.tsx        # Route: /settings
+├── api/
+│   └── webhooks/
+│       └── route.ts        # Route Handler (named HTTP exports: GET, POST, etc.)
+components/
+├── ui/                     # Primitives (shadcn/ui)
+├── forms/                  # Form components (client)
+├── layouts/                # Layout partials (server)
+└── shared/                 # Shared components
+lib/
+├── utils.ts                # cn() and general utilities
+├── db.ts                   # Database client
+├── env.ts                  # Typed env validation (zod)
+├── auth.ts                 # Auth helpers
+└── cloudflare.ts           # Cloudflare bindings helpers
+actions/                    # Server Actions (co-located or centralized)
+proxy.ts                    # Next.js 16 proxy (replaces middleware.ts)
+open-next.config.ts         # OpenNext Cloudflare adapter config
+wrangler.jsonc              # Cloudflare Workers config
+next.config.ts              # Next.js config with cacheComponents enabled
+```
+
+### File Naming
+
+- Route files: always lowercase (`page.tsx`, `layout.tsx`, `loading.tsx`, `error.tsx`, `route.ts`)
+- Components: PascalCase (`UserProfile.tsx`, `DashboardCard.tsx`)
+- Utilities and libs: camelCase (`formatDate.ts`, `parseQuery.ts`)
+- Server Actions: camelCase verb-noun (`createProject.ts`, `updateProfile.ts`)
+- Types: PascalCase in dedicated files or co-located (`types.ts`, inline with component)
+
+### Key File Convention Rules
+
+- A folder becomes a route only when it contains `page.tsx`
+- `layout.tsx` persists across navigation (no remount). Use `template.tsx` only when you need remount-on-navigate behavior
+- `error.tsx` and `global-error.tsx` MUST be Client Components (`"use client"`)
+- `default.tsx` is required in parallel route slots (`@folder`) for unmatched states
+- `proxy.ts` lives at project root — replaces `middleware.ts` (deprecated in Next.js 16)
+- Route groups `(name)` organize files without affecting URLs
+- Dynamic segments: `[id]`, catch-all: `[...slug]`, optional catch-all: `[[...slug]]`
+- In Next.js 16, `params` is a `Promise` — always `await params` before use
+
+## Component Model — Server vs Client
+
+### Server Components (default)
+
+Every component in `app/` is a Server Component unless marked otherwise. Prefer server components for:
+- Data fetching (direct async/await, no useEffect)
+- Heavy computation and data transformation
+- Accessing backend resources (DB, filesystem, secrets)
+- Rendering static or data-driven UI
+
+```tsx
+// app/dashboard/page.tsx — Server Component (default)
+import { db } from "@/lib/db";
+
+export default async function DashboardPage() {
+  const stats = await db.query.stats.findMany();
+  return <StatsGrid stats={stats} />;
+}
+```
+
+### Client Components
+
+Add `"use client"` ONLY when the component needs:
+- React hooks (useState, useEffect, useRef, useActionState, etc.)
+- Event handlers (onClick, onSubmit, onChange)
+- Browser APIs (window, document, localStorage, IntersectionObserver)
+- Third-party client libraries that use hooks or browser APIs
+
+```tsx
+"use client";
+
+import { useState } from "react";
+import { cn } from "@/lib/utils";
+
+interface CounterProps {
+  initialCount?: number;
+}
+
+export function Counter({ initialCount = 0 }: CounterProps) {
+  const [count, setCount] = useState(initialCount);
+  return (
+    <button
+      onClick={() => setCount((c) => c + 1)}
+      className={cn("rounded-lg px-4 py-2", count > 10 && "bg-primary text-primary-foreground")}
+    >
+      {count}
+    </button>
+  );
+}
+```
+
+### Critical Rules
+
+- NEVER use `"use client"` on `page.tsx` or `layout.tsx` — extract interactive parts into child Client Components
+- Push `"use client"` as far down the tree as possible (leaf components)
+- NEVER import server-only code (db, secrets, fs) in Client Components
+- NEVER use `getServerSideProps`, `getStaticProps`, or any Pages Router pattern
+- NEVER import from `next/router` — use `next/navigation` (`useRouter`, `usePathname`, `useSearchParams`)
+- NEVER use `<Head>` from `next/head` — use `metadata` export or `generateMetadata()`
+
+## React 19 Patterns
+
+### Form Handling with useActionState + useFormStatus
+
+```tsx
+"use client";
+
+import { useActionState } from "react";
+import { useFormStatus } from "react-dom";
+import { createProject } from "@/actions/createProject";
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? "Creating..." : "Create Project"}
+    </button>
+  );
+}
+
+export function CreateProjectForm() {
+  const [state, formAction, isPending] = useActionState(createProject, null);
+
+  return (
+    <form action={formAction}>
+      <input name="name" required />
+      {state?.error && <p className="text-destructive">{state.error}</p>}
+      <SubmitButton />
+    </form>
+  );
+}
+```
+
+### Key React 19 Rules
+
+- `useActionState` replaces deprecated `useFormState` — import from `"react"`, not `"react-dom"`
+- `useFormStatus` must be called in a child component rendered INSIDE the `<form>`, not in the form component itself
+- Server Action functions receive `(prevState, formData)` when used with `useActionState` — the first arg is always previous state
+- `useOptimistic` for instant UI feedback before server responds
+- `use()` hook to unwrap Promises and Context in render — replaces some useEffect patterns
+- Refs can be passed as regular props (no `forwardRef` wrapper needed in React 19)
+- `<Context>` shorthand replaces `<Context.Provider>`
+
+## Data Fetching
+
+### Server Components (primary pattern)
+
+```tsx
+export default async function BlogPage() {
+  const posts = await db.query.posts.findMany({
+    orderBy: desc(posts.createdAt),
+    limit: 20,
+  });
+  return <PostList posts={posts} />;
+}
+```
+
+### Parallel Data Fetching
+
+```tsx
+export default async function DashboardPage() {
+  const [stats, recentActivity, notifications] = await Promise.all([
+    getStats(),
+    getRecentActivity(),
+    getNotifications(),
+  ]);
+  return (
+    <>
+      <StatsGrid stats={stats} />
+      <ActivityFeed items={recentActivity} />
+      <NotificationList notifications={notifications} />
+    </>
+  );
+}
+```
+
+### Rules
+
+- Fetch data in Server Components with async/await — NEVER use useEffect + fetch + useState for initial data loads
+- Use `Promise.all` for independent parallel requests — avoid sequential waterfalls
+- For client-side real-time/polling data, use TanStack Query (React Query) — never raw useEffect + fetch
+- Use `loading.tsx` for route-level Suspense boundaries
+- Use `<Suspense>` with fallback for component-level streaming
+
+## Next.js 16 Cache Components
+
+Enable in `next.config.ts`:
+```ts
+const nextConfig: NextConfig = {
+  cacheComponents: true,
+};
+```
+
+### `"use cache"` Directive
+
+```tsx
+"use cache";
+
+import { cacheLife, cacheTag } from "next/cache";
+
+export async function getProducts() {
+  cacheLife("hours");
+  cacheTag("products");
+  const products = await db.query.products.findMany();
+  return products;
+}
+```
+
+### Cache Invalidation
+
+- `updateTag(tag)` — Server Actions only. Immediate cache expiry + fresh data in same request. Use for user-facing mutations (read-your-writes).
+- `revalidateTag(tag, profile)` — Server Actions and Route Handlers. Stale-while-revalidate. Use `'max'` profile for most cases.
+- `revalidatePath(path)` — unchanged from previous model.
+
+```tsx
+"use server";
+
+import { updateTag, revalidateTag } from "next/cache";
+
+export async function updateProduct(formData: FormData) {
+  await db.update(products).set({ name: formData.get("name") });
+  updateTag("products"); // User sees change immediately
+}
+
+// In a webhook Route Handler:
+export async function POST(request: Request) {
+  await processWebhook(request);
+  revalidateTag("products", "max"); // Background revalidation is fine
+}
+```
+
+### Built-in cacheLife Profiles
+
+| Profile     | stale   | revalidate | expire  |
+|-------------|---------|------------|---------|
+| `default`   | 0       | 15 min     | never   |
+| `seconds`   | 0       | 1 s        | 60 s    |
+| `minutes`   | 5 min   | 1 min      | 1 hr    |
+| `hours`     | 5 min   | 1 hr       | 1 day   |
+| `days`      | 5 min   | 1 day      | 1 week  |
+| `weeks`     | 5 min   | 1 week     | 1 month |
+| `max`       | 5 min   | 1 month    | never   |
+
+### Rules
+
+- NEVER use `export const dynamic`, `export const revalidate`, or `export const fetchCache` — they error with cacheComponents
+- Always set an explicit `cacheLife` profile in every `"use cache"` scope
+- Dynamic request APIs (`cookies()`, `headers()`, `params`, `searchParams`) MUST be read outside `"use cache"` scopes — wrap in `<Suspense>` boundaries
+- Components that read request-time data become "dynamic holes" in the static shell
+- Use `cacheTag()` to label data for targeted invalidation
+- Prefer `updateTag()` in Server Actions for mutations the user should see immediately
+- Prefer `revalidateTag(tag, 'max')` for background refresh (webhooks, admin changes, catalog updates)
+
+## Server Actions
+
+```tsx
+// actions/createProject.ts
+"use server";
+
+import { z } from "zod";
+import { db } from "@/lib/db";
+import { updateTag } from "next/cache";
+import { auth } from "@/lib/auth";
+
+const schema = z.object({
+  name: z.string().min(1).max(100),
+  description: z.string().max(500).optional(),
+});
+
+type ActionState = {
+  success: boolean;
+  error?: string;
+  data?: { id: string };
+} | null;
+
+export async function createProject(
+  prevState: ActionState,
+  formData: FormData
+): Promise<ActionState> {
+  const session = await auth();
+  if (!session) return { success: false, error: "Unauthorized" };
+
+  const parsed = schema.safeParse({
+    name: formData.get("name"),
+    description: formData.get("description"),
+  });
+
+  if (!parsed.success) {
+    return { success: false, error: parsed.error.issues[0].message };
+  }
+
+  try {
+    const [project] = await db.insert(projects).values({
+      ...parsed.data,
+      ownerId: session.user.id,
+    }).returning();
+
+    updateTag("projects");
+    return { success: true, data: { id: project.id } };
+  } catch {
+    return { success: false, error: "Failed to create project. Please try again." };
+  }
+}
+```
+
+### Rules
+
+- Always validate input with zod — Server Actions receive untrusted data
+- Always authenticate/authorize before processing
+- Return typed result objects — NEVER throw errors to the client for expected failures
+- When used with `useActionState`, the first parameter is always `prevState`
+- Use `updateTag()` for cache invalidation in Server Actions (read-your-writes)
+- Server Actions are POST requests — suitable for mutations, not reads
+
+## Route Handlers (API Routes)
+
+```tsx
+// app/api/webhooks/stripe/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+
+export async function POST(request: NextRequest) {
+  const signature = request.headers.get("stripe-signature");
+  if (!signature) {
+    return NextResponse.json({ error: "Missing signature" }, { status: 401 });
+  }
+
+  try {
+    const body = await request.json();
+    // ... process webhook
+    return NextResponse.json({ received: true }, { status: 200 });
+  } catch {
+    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+  }
+}
+```
+
+### Rules
+
+- Route Handlers live in `app/api/` as `route.ts` files
+- Export named functions matching HTTP methods: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`
+- Always validate request body with zod
+- Always return proper HTTP status codes
+- Use `NextRequest` and `NextResponse` types
+- Authenticate before processing — check session or verify webhook signatures
+- For cache invalidation in Route Handlers, use `revalidateTag(tag, 'max')` (NOT `updateTag`)
+
+## Proxy (replaces Middleware)
+
+```ts
+// proxy.ts — project root
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+export function proxy(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  if (pathname.startsWith("/dashboard")) {
+    const token = request.cookies.get("session");
+    if (!token) {
+      return NextResponse.redirect(new URL("/login", request.url));
+    }
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/settings/:path*"],
+};
+```
+
+### Rules
+
+- `proxy.ts` at project root replaces `middleware.ts` (deprecated in Next.js 16)
+- Export function is named `proxy()`, not `middleware()`
+- Keep proxy logic minimal — auth redirects, locale detection, header injection
+- NEVER do heavy computation, database queries, or data fetching in the proxy
+- Run `npx @next/codemod@latest upgrade` to auto-migrate from middleware.ts
+
+## TypeScript Strict Mode
+
+- NEVER use `any` — use `unknown` and narrow with type guards
+- NEVER use `@ts-ignore` or `@ts-expect-error` without an explaining comment
+- NEVER use `as Type` casts without a guard function verifying the shape
+- All exported functions MUST have explicit return types
+- Use `interface` for object shapes with extension points, `type` for unions/intersections/utility types
+- Props interfaces are named `{ComponentName}Props`
+- Prefer `as const` assertions and template literal types over enums
+- Validate all external data boundaries (API responses, form data, env vars) with zod
+
+```ts
+// lib/env.ts — typed environment variables
+import { z } from "zod";
+
+const envSchema = z.object({
+  DATABASE_URL: z.string().url(),
+  AUTH_SECRET: z.string().min(32),
+  NEXT_PUBLIC_APP_URL: z.string().url(),
+});
+
+export const env = envSchema.parse(process.env);
+```
+
+## Error Handling
+
+### Result Pattern for Server Actions
+
+```ts
+type ActionResult<T = void> =
+  | { success: true; data: T }
+  | { success: false; error: string };
+```
+
+### Error Boundaries
+
+- `error.tsx` per route segment for localized error recovery with `reset()` function
+- `global-error.tsx` at app root for catastrophic errors (must render own `<html>` and `<body>`)
+- Both MUST be Client Components
+- Use `<Suspense>` boundaries to isolate failures in streaming scenarios
+
+### Rules
+
+- Return user-friendly error messages — NEVER expose stack traces, SQL errors, or internal details
+- Log errors with structured context (request ID, user ID, action name) server-side
+- Use toast notifications for recoverable client-side errors
+- Use error pages for unrecoverable errors (404, 500)
+
+## Performance Best Practices
+
+- Server Components by default — they produce zero client JS
+- Use `next/dynamic` with `{ ssr: false }` for heavy client-only components (charts, editors)
+- Use `next/image` for all images with explicit `width`/`height` or `fill` — use `priority` only for above-the-fold (LCP) images
+- Use `next/font` for font loading — NEVER load fonts from external CDNs in `<head>`
+- Prefer CSS/Tailwind animations over JavaScript animations
+- Use `loading.tsx` and `<Suspense>` for streaming — avoid blocking entire pages on slow data
+- Parallel data fetching with `Promise.all` — avoid sequential waterfalls
+- Set explicit `cacheLife` profiles on all cached data — don't rely on implicit defaults
+- Keep Client Components small and at leaf positions in the tree
+- Use route groups to create separate layouts — avoid re-rendering shared UI
+
+## Import Conventions
+
+```tsx
+// 1. React/Next.js imports
+import { Suspense } from "react";
+import Image from "next/image";
+import Link from "next/link";
+import { redirect } from "next/navigation";
+
+// 2. Third-party imports
+import { z } from "zod";
+
+// 3. Internal imports (path aliases)
+import { db } from "@/lib/db";
+import { auth } from "@/lib/auth";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
+
+// 4. Relative imports (co-located files)
+import { StatsCard } from "./stats-card";
+
+// 5. Types (import type when possible)
+import type { Metadata } from "next";
+import type { User } from "@/lib/types";
+```
+
+### Rules
+
+- Use `@/` path alias for all project imports (configured in tsconfig `paths`)
+- Use `import type` for type-only imports — reduces bundle size
+- Never use relative paths that go up more than one level (`../../` is a smell — use `@/`)
+- Group imports in the order above with blank lines between groups
+
+## Component Structure Convention
+
+```tsx
+// 1. Directive (only if needed)
+"use client";
+
+// 2. Imports (grouped as above)
+import { useState } from "react";
+import { cn } from "@/lib/utils";
+
+// 3. Types
+interface FeatureCardProps {
+  title: string;
+  description: string;
+  isHighlighted?: boolean;
+}
+
+// 4. Component
+export function FeatureCard({ title, description, isHighlighted = false }: FeatureCardProps) {
+  const [isExpanded, setIsExpanded] = useState(false);
+
+  if (!title) return null;
+
+  return (
+    <div className={cn("rounded-lg border p-6", isHighlighted && "border-primary bg-primary/5")}>
+      <h3 className="text-lg font-semibold">{title}</h3>
+      {isExpanded && <p className="mt-2 text-muted-foreground">{description}</p>}
+    </div>
+  );
+}
+
+// 5. Helper functions (below the component, not above)
+```
+
+### Rules
+
+- Named exports for components — default exports only for `page.tsx`, `layout.tsx`, `loading.tsx`, `error.tsx`, `not-found.tsx`, `template.tsx`, `global-error.tsx`
+- Destructure props in the function signature
+- Use early returns for guard clauses
+- Keep components under 150 lines — extract sub-components if longer
+- Co-locate component-specific types with the component
+
+## Cloudflare Workers Deployment (OpenNext)
+
+### Configuration
+
+```ts
+// open-next.config.ts
+import { defineCloudflareConfig } from "@opennextjs/cloudflare";
+import r2IncrementalCache from "@opennextjs/cloudflare/overrides/incremental-cache/r2-incremental-cache";
+import { withRegionalCache } from "@opennextjs/cloudflare/overrides/incremental-cache/regional-cache";
+
+export default defineCloudflareConfig({
+  incrementalCache: withRegionalCache(r2IncrementalCache, { mode: "long-lived" }),
+});
+```
+
+```jsonc
+// wrangler.jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "main": ".open-next/worker.js",
+  "name": "cvfairy",
+  "compatibility_date": "2024-12-30",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "services": [
+    { "binding": "WORKER_SELF_REFERENCE", "service": "cvfairy" }
+  ],
+  "r2_buckets": [
+    { "binding": "NEXT_INC_CACHE_R2_BUCKET", "bucket_name": "cvfairy-cache" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "NEXT_CACHE_DO_QUEUE", "class_name": "DOQueueHandler" }
+    ]
+  }
+}
+```
+
+### Access Cloudflare Bindings
+
+```ts
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+
+export async function uploadToR2(file: File) {
+  const { env } = await getCloudflareContext();
+  await env.UPLOADS.put(file.name, file.stream());
+}
+```
+
+### Cloudflare-Specific Rules
+
+- Use `@opennextjs/cloudflare` adapter (NOT `@cloudflare/next-on-pages` which is legacy)
+- Use R2 for incremental cache with `withRegionalCache` in `long-lived` mode
+- DO NOT use KV for incremental cache — it is eventually consistent and causes stale data
+- Use Durable Objects for the revalidation queue and tag cache
+- `nodejs_compat` flag is required in wrangler.jsonc
+- `compatibility_date` must be `2024-09-23` or later
+- Worker compressed size limit: 3 MiB (free), 10 MiB (paid)
+- Use `getCloudflareContext()` to access bindings (R2, KV, D1, DO) from Server Components and Actions
+- Run `npx wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts` to generate binding types
+- Use `initOpenNextCloudflareForDev()` in `next.config.ts` for local dev with bindings
+- Commands: `npm run preview` (local Workers runtime), `npm run deploy` (deploy to Cloudflare)
+- Add `public/_headers` for static asset caching headers
+- Add `.open-next` to `.gitignore`
+
+## Metadata and SEO
+
+```tsx
+// Static metadata
+export const metadata: Metadata = {
+  title: "Dashboard | CVFairy",
+  description: "Manage your CV and job applications",
+};
+
+// Dynamic metadata
+export async function generateMetadata({ params }: { params: Promise<{ slug: string }> }): Promise<Metadata> {
+  const { slug } = await params;
+  const post = await getPost(slug);
+  return {
+    title: post.title,
+    description: post.excerpt,
+    openGraph: { title: post.title, description: post.excerpt, images: [post.coverImage] },
+  };
+}
+```
+
+### Rules
+
+- Use `metadata` export or `generateMetadata()` in `page.tsx` or `layout.tsx`
+- NEVER use `<Head>` from `next/head`
+- Always include `title`, `description`, and `openGraph` for public pages
+- In Next.js 16, `params` in `generateMetadata` is a `Promise` — must be awaited
+
+## Security Rules
+
+- NEVER hardcode secrets, API keys, or credentials
+- NEVER expose server-only env vars to the client (no `NEXT_PUBLIC_` prefix for secrets)
+- NEVER log environment variables or sensitive data
+- Always validate and sanitize user input at the boundary (Server Actions, Route Handlers)
+- Use parameterized queries — NEVER concatenate user input into SQL
+- Authenticate before processing in every Server Action and Route Handler
+- Use CSRF protection (built into Server Actions by default)
+- Rate-limit public API endpoints
+- Set security headers in proxy.ts or wrangler.jsonc
+
+## Do NOT
+
+- Use Pages Router patterns (`getServerSideProps`, `getStaticProps`, `pages/` directory)
+- Use `next/router` — always `next/navigation`
+- Use `<Head>` from `next/head` — use metadata API
+- Use `middleware.ts` — use `proxy.ts` (Next.js 16)
+- Use `export const dynamic`, `export const revalidate`, `export const fetchCache` — use Cache Components
+- Use `useFormState` from `react-dom` — use `useActionState` from `react`
+- Use `forwardRef` — pass refs as regular props (React 19)
+- Use `any` type — use `unknown` and narrow
+- Use CSS Modules or styled-components — use Tailwind CSS
+- Use `useEffect` + `fetch` + `useState` for initial data loading — use Server Components or TanStack Query
+- Use `@cloudflare/next-on-pages` — use `@opennextjs/cloudflare`
+- Use KV for incremental cache — use R2
+- Use single-argument `revalidateTag(tag)` — always pass a cacheLife profile as second arg

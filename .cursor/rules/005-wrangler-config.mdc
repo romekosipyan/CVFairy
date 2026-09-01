@@ -1,0 +1,246 @@
+---
+description: "Reference wrangler.jsonc configuration for CVFairy — copy and adapt when initializing the project"
+globs: ["wrangler.jsonc", "wrangler.toml", "wrangler.json"]
+alwaysApply: false
+---
+
+# Wrangler Configuration Reference
+
+Cloudflare recommends `wrangler.jsonc` for new projects (JSON with comments, better tooling support).
+
+## Recommended wrangler.jsonc for CVFairy
+
+```jsonc
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cvfairy",
+  "compatibility_date": "2026-09-01",
+  // nodejs_compat is automatic for compatibility_date >= 2026-08-04
+  // No need to set compatibility_flags for Node.js compat
+
+  // ─── D1 Database ───────────────────────────────────────────────
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cvfairy-db",
+      "database_id": "<YOUR_D1_DATABASE_ID>",
+      "migrations_dir": "drizzle"
+    }
+  ],
+
+  // ─── R2 Object Storage ────────────────────────────────────────
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "cvfairy-uploads"
+    }
+  ],
+
+  // ─── KV Namespaces ────────────────────────────────────────────
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "<YOUR_KV_NAMESPACE_ID>"
+    }
+  ],
+
+  // ─── Workers AI ────────────────────────────────────────────────
+  "ai": {
+    "binding": "AI"
+  },
+
+  // ─── Non-sensitive environment variables ───────────────────────
+  "vars": {
+    "ENVIRONMENT": "production",
+    "NEXT_PUBLIC_APP_NAME": "CVFairy"
+  },
+
+  // ─── Preview / Staging Environment ─────────────────────────────
+  "env": {
+    "preview": {
+      "name": "cvfairy-preview",
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "cvfairy-db-preview",
+          "database_id": "<YOUR_PREVIEW_D1_DATABASE_ID>",
+          "migrations_dir": "drizzle"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "R2",
+          "bucket_name": "cvfairy-uploads-preview"
+        }
+      ],
+      "kv_namespaces": [
+        {
+          "binding": "KV",
+          "id": "<YOUR_PREVIEW_KV_NAMESPACE_ID>"
+        }
+      ],
+      "ai": {
+        "binding": "AI"
+      },
+      "vars": {
+        "ENVIRONMENT": "preview"
+      }
+    }
+  }
+}
+```
+
+## If Using vinext (Preferred Path)
+
+When using vinext, the `vite.config.ts` handles the Cloudflare plugin configuration.
+The wrangler.jsonc above still defines your bindings. vinext reads it automatically.
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import { vinext } from "vinext";
+import { cloudflare } from "@cloudflare/vite-plugin";
+import { cdnAdapter, kvDataAdapter } from "@vinext/cloudflare";
+import { imagesOptimizer } from "@vinext/cloudflare";
+
+export default defineConfig({
+  plugins: [
+    vinext({
+      cache: {
+        cdn: cdnAdapter(),
+        data: kvDataAdapter(),
+      },
+      images: {
+        optimizer: imagesOptimizer(),
+      },
+    }),
+    cloudflare({
+      viteEnvironment: {
+        name: "rsc",
+        childEnvironments: ["ssr"],
+      },
+    }),
+  ],
+});
+```
+
+## If Using @opennextjs/cloudflare (Fallback Path)
+
+Add the `open-next.config.ts` at project root:
+
+```typescript
+// open-next.config.ts
+import type { OpenNextConfig } from "@opennextjs/cloudflare";
+
+export default {
+  default: {
+    override: {
+      wrapper: "cloudflare-node",
+      converter: "edge",
+      incrementalCache: "dummy",
+      tagCache: "dummy",
+      queue: "dummy",
+    },
+  },
+} satisfies OpenNextConfig;
+```
+
+And the `next.config.ts`:
+
+```typescript
+// next.config.ts
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  // Exclude build-only packages to reduce Worker bundle size
+  serverExternalPackages: [
+    // Add packages here that are only used at build time
+  ],
+};
+
+export default nextConfig;
+```
+
+## Creating Cloudflare Resources (Run Once)
+
+```bash
+# Create D1 database
+npx wrangler d1 create cvfairy-db
+npx wrangler d1 create cvfairy-db-preview
+
+# Create R2 bucket
+npx wrangler r2 bucket create cvfairy-uploads
+npx wrangler r2 bucket create cvfairy-uploads-preview
+
+# Create KV namespace
+npx wrangler kv namespace create KV
+npx wrangler kv namespace create KV --preview
+
+# Set secrets
+npx wrangler secret put AUTH_SECRET
+npx wrangler secret put AUTH_SECRET --env preview
+
+# Generate TypeScript types from bindings
+npx wrangler types
+```
+
+After running the create commands, copy the returned IDs into the `wrangler.jsonc` placeholders.
+
+## Local Development (.dev.vars)
+
+Create `.dev.vars` in project root (gitignored):
+
+```
+AUTH_SECRET=local-dev-secret-change-me
+CLOUDFLARE_ACCOUNT_ID=your-account-id
+CLOUDFLARE_D1_TOKEN=your-api-token
+D1_DATABASE_ID=your-d1-database-id
+```
+
+## package.json Scripts
+
+```json
+{
+  "scripts": {
+    "dev": "vinext dev",
+    "build": "vinext build",
+    "deploy": "npx @vinext/cloudflare deploy",
+    "deploy:preview": "npx @vinext/cloudflare deploy --env preview",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "db:studio": "drizzle-kit studio",
+    "cf:types": "wrangler types",
+    "test": "vitest",
+    "lint": "next lint"
+  }
+}
+```
+
+## CI/CD (GitHub Actions)
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Cloudflare
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx wrangler d1 migrations apply DB --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - run: npx @vinext/cloudflare deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```

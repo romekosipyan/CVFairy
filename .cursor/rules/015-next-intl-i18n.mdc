@@ -1,0 +1,505 @@
+---
+description: "next-intl internationalization: App Router integration, middleware locale detection, server/client translations, message organization, pluralization, SEO hreflang, and dynamic locale switching"
+globs: ["**/i18n/**", "**/messages/**", "**/[locale]/**", "**/middleware.ts", "**/proxy.ts", "**/*.messages.ts", "**/locales/**"]
+alwaysApply: false
+---
+
+# next-intl Internationalization Rules
+
+## Architecture Overview
+
+next-intl is the standard i18n library for Next.js App Router (2026). It provides:
+- Server Component translations via `getTranslations` (no hooks, no providers)
+- Client Component translations via `useTranslations` hook
+- Middleware-based locale detection and routing
+- Type-safe translation keys with TypeScript
+- Built-in pluralization, date/number formatting, and rich text
+
+## Project Structure
+
+```
+├── i18n/
+│   ├── routing.ts          # Locale list, default locale, prefix strategy
+│   ├── request.ts          # Server-side request config (message loading)
+│   └── navigation.ts       # Locale-aware Link, redirect, usePathname
+├── messages/
+│   ├── en.json             # English translations
+│   ├── es.json             # Spanish translations
+│   └── fr.json             # French translations
+├── middleware.ts            # Locale detection and routing (or proxy.ts in Next.js 16+)
+├── app/
+│   └── [locale]/
+│       ├── layout.tsx       # Root locale layout with NextIntlClientProvider
+│       ├── page.tsx         # Home page
+│       └── dashboard/
+│           └── page.tsx     # Nested route
+└── next.config.ts           # Uses createNextIntlPlugin
+```
+
+## Core Setup Files
+
+### Routing Configuration
+```typescript
+// i18n/routing.ts
+import { defineRouting } from 'next-intl/routing';
+
+export const routing = defineRouting({
+  locales: ['en', 'es', 'fr', 'de'] as const,
+  defaultLocale: 'en',
+  localePrefix: 'always', // 'always' is SEO-preferred — no ambiguity for search engines
+});
+
+export type Locale = (typeof routing.locales)[number];
+```
+
+### Request Configuration
+```typescript
+// i18n/request.ts
+import { getRequestConfig } from 'next-intl/server';
+import { hasLocale } from 'next-intl';
+import { routing } from './routing';
+import { notFound } from 'next/navigation';
+
+export default getRequestConfig(async ({ requestLocale }) => {
+  const requested = await requestLocale;
+  const locale = hasLocale(routing.locales, requested) ? requested : routing.defaultLocale;
+
+  if (!hasLocale(routing.locales, requested)) {
+    notFound();
+  }
+
+  return {
+    locale,
+    messages: (await import(`../messages/${locale}.json`)).default,
+  };
+});
+```
+
+### Navigation Utilities
+```typescript
+// i18n/navigation.ts
+import { createNavigation } from 'next-intl/navigation';
+import { routing } from './routing';
+
+export const { Link, redirect, usePathname, useRouter, getPathname } =
+  createNavigation(routing);
+```
+
+### Next.js Config
+```typescript
+// next.config.ts
+import createNextIntlPlugin from 'next-intl/plugin';
+
+const withNextIntl = createNextIntlPlugin('./i18n/request.ts');
+
+const nextConfig = {
+  // ... other config
+};
+
+export default withNextIntl(nextConfig);
+```
+
+## Middleware / Proxy
+
+### Next.js 15 (middleware.ts)
+```typescript
+// middleware.ts
+import createMiddleware from 'next-intl/middleware';
+import { routing } from './i18n/routing';
+
+export default createMiddleware(routing);
+
+export const config = {
+  matcher: ['/((?!api|trpc|_next|_vercel|.*\\..*).*)',],
+};
+```
+
+### Next.js 16+ (proxy.ts — renamed from middleware.ts)
+- Next.js 16 renames `middleware.ts` → `proxy.ts` and the export from `middleware` → `proxy`
+- The old file still works but is deprecated
+- Run `npx @next/codemod middleware-to-proxy .` to migrate
+- The logic is identical; the runtime is Node-only (no Edge)
+
+The middleware handles:
+- Reading `Accept-Language` header from the browser
+- Cookie-based locale persistence when user switches
+- Redirecting `/` → `/en/` (or whichever locale matches)
+- Passing the resolved locale to layouts and pages
+
+## Root Locale Layout
+
+```typescript
+// app/[locale]/layout.tsx
+import { NextIntlClientProvider } from 'next-intl';
+import { getMessages, setRequestLocale } from 'next-intl/server';
+import { hasLocale } from 'next-intl';
+import { notFound } from 'next/navigation';
+import { routing } from '@/i18n/routing';
+
+type Props = {
+  children: React.ReactNode;
+  params: Promise<{ locale: string }>;
+};
+
+export function generateStaticParams() {
+  return routing.locales.map((locale) => ({ locale }));
+}
+
+export default async function LocaleLayout({ children, params }: Props) {
+  const { locale } = await params;
+
+  if (!hasLocale(routing.locales, locale)) {
+    notFound();
+  }
+
+  setRequestLocale(locale);
+
+  const messages = await getMessages();
+
+  return (
+    <html lang={locale}>
+      <body>
+        <NextIntlClientProvider messages={messages}>
+          {children}
+        </NextIntlClientProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+## Server Component Translations
+
+- Use `getTranslations` from `next-intl/server` — no hooks, no providers needed
+- Call `setRequestLocale(locale)` at the top of every page and layout for static rendering
+- This is the MANDATORY pattern for all pages under `app/[locale]/`
+
+```typescript
+// app/[locale]/dashboard/page.tsx
+import { getTranslations, setRequestLocale } from 'next-intl/server';
+
+type Props = {
+  params: Promise<{ locale: string }>;
+};
+
+export default async function DashboardPage({ params }: Props) {
+  const { locale } = await params;
+  setRequestLocale(locale);
+
+  const t = await getTranslations('Dashboard');
+
+  return (
+    <main>
+      <h1>{t('title')}</h1>
+      <p>{t('description')}</p>
+    </main>
+  );
+}
+```
+
+## Client Component Translations
+
+- Use the `useTranslations` hook — requires `NextIntlClientProvider` ancestor
+- Only add `'use client'` when the component genuinely needs interactivity or browser APIs
+- Keep client components as small leaf nodes; server shell fetches data
+
+```typescript
+'use client';
+
+import { useTranslations } from 'next-intl';
+
+export function SubscriptionCard() {
+  const t = useTranslations('Billing');
+
+  return (
+    <div>
+      <h2>{t('currentPlan')}</h2>
+      <button onClick={() => handleUpgrade()}>
+        {t('upgradeCta')}
+      </button>
+    </div>
+  );
+}
+```
+
+## Message File Organization
+
+### Structure by Feature Namespace
+```json
+// messages/en.json
+{
+  "Common": {
+    "appName": "CVFairy",
+    "loading": "Loading...",
+    "save": "Save",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "confirm": "Confirm"
+  },
+  "Navigation": {
+    "home": "Home",
+    "dashboard": "Dashboard",
+    "pricing": "Pricing",
+    "settings": "Settings"
+  },
+  "Auth": {
+    "signIn": "Sign in",
+    "signUp": "Sign up",
+    "signOut": "Sign out"
+  },
+  "Dashboard": {
+    "title": "Dashboard",
+    "description": "Manage your CVs and applications"
+  },
+  "Billing": {
+    "currentPlan": "Current Plan",
+    "upgradeCta": "Upgrade",
+    "manageBilling": "Manage Billing",
+    "freeTier": "Free",
+    "proTier": "Pro",
+    "businessTier": "Business"
+  },
+  "Pricing": {
+    "title": "Simple, transparent pricing",
+    "monthly": "Monthly",
+    "annual": "Annual",
+    "lifetime": "Lifetime",
+    "perMonth": "{price}/month",
+    "perYear": "{price}/year",
+    "oneTime": "One-time payment",
+    "savings": "Save {percentage}%",
+    "features": {
+      "projects": "{count, plural, one {# project} other {# projects}}",
+      "unlimitedProjects": "Unlimited projects",
+      "storage": "{amount} MB storage"
+    }
+  },
+  "Metadata": {
+    "title": "CVFairy — AI-Powered CV Builder",
+    "description": "Create professional CVs in minutes"
+  }
+}
+```
+
+### Rules for Message Files
+- One JSON file per locale: `messages/{locale}.json`
+- Organize keys by feature namespace (PascalCase): `Dashboard`, `Billing`, `Pricing`
+- Keep key paths shallow (max 3 levels deep)
+- Use ICU message syntax for pluralization and formatting
+- All locales MUST have identical key structures — missing keys break at runtime
+- Never put HTML in translation strings; use rich text formatting instead
+
+## Pluralization & Formatting
+
+### ICU Message Syntax
+```json
+{
+  "Pricing": {
+    "features": {
+      "projects": "{count, plural, one {# project} other {# projects}}",
+      "storage": "{amount, number} MB storage",
+      "trialDays": "{days, plural, =0 {Trial expired} one {# day left} other {# days left}}"
+    }
+  },
+  "Billing": {
+    "nextPayment": "Next payment: {date, date, medium}",
+    "amount": "{amount, number, ::currency/USD}"
+  }
+}
+```
+
+### Usage in Components
+```typescript
+const t = useTranslations('Pricing.features');
+t('projects', { count: 5 });      // "5 projects"
+t('projects', { count: 1 });      // "1 project"
+t('trialDays', { days: 0 });      // "Trial expired"
+```
+
+### Rich Text (instead of HTML in strings)
+```typescript
+// In JSON: "terms": "By signing up you agree to our <link>Terms of Service</link>"
+t.rich('terms', {
+  link: (chunks) => <a href="/terms">{chunks}</a>,
+});
+```
+
+## Dynamic Locale Switching
+
+Use the locale-aware `Link` and `useRouter` from `i18n/navigation.ts`:
+
+```typescript
+'use client';
+
+import { useLocale } from 'next-intl';
+import { usePathname, useRouter } from '@/i18n/navigation';
+import { routing } from '@/i18n/routing';
+
+export function LocaleSwitcher() {
+  const locale = useLocale();
+  const pathname = usePathname();
+  const router = useRouter();
+
+  function handleChange(newLocale: string) {
+    router.replace(pathname, { locale: newLocale });
+  }
+
+  return (
+    <select value={locale} onChange={(e) => handleChange(e.target.value)}>
+      {routing.locales.map((loc) => (
+        <option key={loc} value={loc}>
+          {loc.toUpperCase()}
+        </option>
+      ))}
+    </select>
+  );
+}
+```
+
+## SEO: Metadata, hreflang, and Sitemaps
+
+### Translated Metadata per Page
+```typescript
+// app/[locale]/pricing/page.tsx
+import { getTranslations, setRequestLocale } from 'next-intl/server';
+import { routing } from '@/i18n/routing';
+import type { Metadata } from 'next';
+
+type Props = { params: Promise<{ locale: string }> };
+
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { locale } = await params;
+  const t = await getTranslations({ locale, namespace: 'Metadata' });
+  const host = 'https://cvfairy.com';
+
+  const languages: Record<string, string> = {};
+  for (const loc of routing.locales) {
+    languages[loc] = `${host}/${loc}/pricing`;
+  }
+  languages['x-default'] = `${host}/${routing.defaultLocale}/pricing`;
+
+  return {
+    title: t('title'),
+    description: t('description'),
+    alternates: {
+      canonical: `${host}/${locale}/pricing`,
+      languages,
+    },
+  };
+}
+```
+
+### hreflang Rules
+- Always include `x-default` pointing to your default locale — Google requires this for clarity
+- Use `localePrefix: 'always'` so every locale has an explicit URL path (no ambiguity)
+- All redirects should use 308 (permanent) to preserve HTTP method
+- Generate hreflang in `generateMetadata` using `alternates.languages`
+
+### Sitemap with Locale Alternates
+```typescript
+// app/sitemap.ts
+import { MetadataRoute } from 'next';
+import { routing } from '@/i18n/routing';
+import { getPathname } from '@/i18n/navigation';
+
+const host = 'https://cvfairy.com';
+
+const pages = ['/', '/pricing', '/about', '/contact'];
+
+export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
+  return pages.flatMap((page) =>
+    routing.locales.map((locale) => {
+      const languages: Record<string, string> = {};
+      for (const loc of routing.locales) {
+        languages[loc] = `${host}/${loc}${page === '/' ? '' : page}`;
+      }
+      languages['x-default'] = `${host}/${routing.defaultLocale}${page === '/' ? '' : page}`;
+
+      return {
+        url: `${host}/${locale}${page === '/' ? '' : page}`,
+        lastModified: new Date(),
+        alternates: { languages },
+      };
+    })
+  );
+}
+```
+
+## Static Rendering
+
+- Call `setRequestLocale(locale)` at the top of every page and layout under `[locale]`
+- Export `generateStaticParams` from the root locale layout to pre-render all locales
+- Without `setRequestLocale`, next-intl falls back to dynamic rendering via headers
+- This is a temporary workaround until next-intl removes the limitation
+
+```typescript
+// Required in every page.tsx and layout.tsx under [locale]
+export default async function Page({ params }: Props) {
+  const { locale } = await params;
+  setRequestLocale(locale); // MUST be first — enables static rendering
+  // ...
+}
+```
+
+## Next.js 16+ with next/root-params
+
+If using Next.js 16.3+, you can use `next/root-params` to simplify the request config:
+
+```typescript
+// i18n/request.ts (Next.js 16.3+)
+import * as rootParams from 'next/root-params';
+import { getRequestConfig } from 'next-intl/server';
+import { hasLocale } from 'next-intl';
+import { routing } from './routing';
+import { notFound } from 'next/navigation';
+
+export default getRequestConfig(async () => {
+  const paramValue = await rootParams.locale();
+  const locale = hasLocale(routing.locales, paramValue) ? paramValue : routing.defaultLocale;
+
+  if (!hasLocale(routing.locales, paramValue)) notFound();
+
+  return {
+    locale,
+    messages: (await import(`../messages/${locale}.json`)).default,
+  };
+});
+```
+
+This eliminates the need for `setRequestLocale` in every page/layout.
+
+## Route Handlers & Server Actions
+
+```typescript
+// app/api/newsletter/route.ts
+import { getTranslations } from 'next-intl/server';
+
+export async function POST(request: Request) {
+  const { locale } = await request.json();
+  const t = await getTranslations({ locale, namespace: 'Newsletter' });
+
+  return Response.json({ message: t('subscribed') });
+}
+```
+
+## Anti-Patterns — NEVER Do These
+
+- Do NOT use `next-i18next` with App Router — it only works with Pages Router
+- Do NOT skip `setRequestLocale` in pages/layouts (causes dynamic rendering fallback)
+- Do NOT put HTML in translation strings — use `t.rich()` with render functions
+- Do NOT hardcode locale strings in components — always use `t()` or the routing config
+- Do NOT create locale-specific component files (`PricingEn.tsx`, `PricingEs.tsx`)
+- Do NOT use `localePrefix: 'as-needed'` unless you have a specific SEO reason — it creates URL ambiguity
+- Do NOT forget `x-default` in hreflang alternates
+- Do NOT nest translation keys more than 3 levels deep
+- Do NOT lazy-load message files per namespace in App Router — load all messages in the layout
+- Do NOT mix `useTranslations` (client) and `getTranslations` (server) in the same component
+
+## Testing
+
+- Verify all locale JSON files have identical key structures (use a CI lint script)
+- Test locale switching: navigate, switch locale, verify URL and content change
+- Test fallback: request unsupported locale → should 404 or redirect to default
+- Test SEO: verify `<link rel="alternate" hreflang="...">` tags in page source
+- Test plural forms in all supported locales (rules differ between languages)
+- Use `next-intl`'s TypeScript integration for compile-time key checking

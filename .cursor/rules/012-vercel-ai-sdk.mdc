@@ -1,0 +1,256 @@
+---
+description: "Rules for Vercel AI SDK v6 — useChat, streaming, tool calling, multi-model providers, and agent patterns"
+globs: ["src/lib/ai/**/*.{ts,tsx}", "src/app/api/chat/**/*.{ts,tsx}", "src/app/api/ai/**/*.{ts,tsx}", "src/components/**/*ai*.{ts,tsx}", "src/components/**/*chat*.{ts,tsx}"]
+alwaysApply: false
+---
+
+# Vercel AI SDK v6 — AI Integration Rules
+
+## Architecture Overview
+
+AI SDK v6 has three layers:
+1. **AI SDK Core** (`ai`): `generateText`, `streamText`, `ToolLoopAgent` — server-side generation
+2. **AI SDK UI** (`@ai-sdk/react`): `useChat`, `useCompletion` — client-side hooks
+3. **AI SDK Providers** (`@ai-sdk/openai`, `@ai-sdk/anthropic`, etc.): model adapters
+
+## useChat Hook (Client-Side)
+
+```tsx
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport } from "@ai-sdk/react";
+
+function ChatInterface() {
+  const [input, setInput] = useState("");
+
+  const { messages, sendMessage, status, stop, error, setMessages } = useChat({
+    transport: new DefaultChatTransport({
+      api: "/api/chat",
+      headers: () => ({ "X-Session-ID": sessionId }),
+      prepareSendMessagesRequest: ({ messages }) => ({
+        body: { messages: messages.slice(-20) }, // limit context window
+      }),
+    }),
+    initialMessages: savedMessages,
+    onFinish: (message) => {
+      persistMessage(message); // ONLY persist on completion, never mid-stream
+    },
+    onError: (err) => {
+      handleChatError(err);
+    },
+  });
+
+  // ...
+}
+```
+
+### useChat Status State Machine
+- `"ready"` → idle, accepting input
+- `"submitted"` → message sent, waiting for first token
+- `"streaming"` → tokens arriving — disable input, show typing indicator
+- `"error"` → stream broke or non-200 response — show retry button
+
+**Always check `status` in your render logic.** Most chatbot quality regressions come from ignoring status transitions.
+
+### Critical useChat Patterns
+- **Persist messages ONLY in `onFinish`** — never on each chunk, never during streaming
+- **Save input before clearing** — if the request fails before streaming starts, the input is lost
+- **Use `initialMessages`** for conversation history — loads into both UI and API context
+- **Use `body` field** on transport for extra context (userId, chatId, feature flags) — don't add it to the messages array
+- **Handle tool call pauses** — when the model calls tools, the UI pauses. Show a "thinking" indicator, not silence.
+
+## streamText (Server-Side Route Handler)
+
+```tsx
+import { streamText, tool } from "ai";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = streamText({
+    model: getModel("default"),
+    system: "You are a resume writing assistant. Be concise and professional.",
+    messages,
+    tools: {
+      improveDescription: tool({
+        description: "Improve a resume bullet point to be more impactful using the STAR method",
+        inputSchema: z.object({
+          original: z.string().describe("The original bullet point text"),
+          role: z.string().describe("The job title for context"),
+        }),
+        execute: async ({ original, role }) => {
+          // tool implementation
+          return { improved: "..." };
+        },
+      }),
+    },
+    stopWhen: stepCountIs(5), // ALWAYS set a stop condition when tools are present
+    onFinish: ({ usage }) => {
+      // Track token usage for billing/monitoring
+      logUsage(usage);
+    },
+  });
+
+  return result.toUIMessageStreamResponse();
+}
+```
+
+### streamText Rules
+- **ALWAYS set `stopWhen`** on any `streamText` call with tools — prevents unbounded loops and runaway costs
+  - Chat interfaces: `stepCountIs(5)` is a sensible default
+  - Autonomous agents: `stepCountIs(10–20)`
+  - Single-tool-then-answer: `stepCountIs(1)`
+- **Never omit `stopWhen`** — without it, a misbehaving model can loop indefinitely
+- Return `result.toUIMessageStreamResponse()` for useChat compatibility
+
+## ToolLoopAgent (Multi-Step Agents)
+
+```tsx
+import { ToolLoopAgent, tool, isStepCount } from "ai";
+import { z } from "zod";
+
+const resumeAgent = new ToolLoopAgent({
+  model: getModel("reasoning"),
+  instructions: "You are an expert resume consultant. Analyze the job description, then improve each resume section.",
+  tools: {
+    analyzeJobPosting: tool({
+      description: "Extract key requirements and keywords from a job posting",
+      inputSchema: z.object({ jobDescription: z.string() }),
+      execute: async ({ jobDescription }) => { /* ... */ },
+    }),
+    improveBullet: tool({
+      description: "Rewrite a resume bullet point for maximum impact",
+      inputSchema: z.object({
+        bullet: z.string(),
+        targetKeywords: z.array(z.string()),
+      }),
+      needsApproval: false,
+      execute: async ({ bullet, targetKeywords }) => { /* ... */ },
+    }),
+  },
+  stopWhen: isStepCount(10),
+});
+
+// Usage
+const result = await resumeAgent.generate({ messages });
+```
+
+### ToolLoopAgent Rules
+- Use for multi-step reasoning tasks, not simple one-shot generation
+- Always provide `stopWhen` — `isStepCount(N)` is the safety cap
+- Use `needsApproval: true` on tools that mutate data, send emails, or incur costs
+- Define agents in separate files, not inline in route handlers — enables reuse and testing
+- Use `runtimeContext` for shared state that flows through the agent loop
+
+## Tool Definition Best Practices
+
+```tsx
+const myTool = tool({
+  description: "Clear, specific description the model uses to decide when to call this tool",
+  inputSchema: z.object({
+    query: z.string().min(1).max(500).describe("What to search for"),
+    limit: z.number().int().positive().max(20).default(5).describe("Max results"),
+  }),
+  strict: true, // opt-in per tool when schema is compatible
+  needsApproval: false, // true for destructive/costly operations
+  execute: async ({ query, limit }) => {
+    // implementation
+    return { results: [] };
+  },
+});
+```
+
+### Tool Rules
+- **Put constraints in the Zod schema**, not just in the description — `z.string().min(1).max(500)`
+- **Write clear `description`** — the model uses this to decide when to invoke the tool
+- **Use `describe()` on each field** — helps the model understand what to provide
+- **Use `strict: true`** per tool when the schema is JSON Schema-compatible for guaranteed schema adherence
+- **Use `needsApproval: true`** for tools that: spend money, mutate records, send messages, cross tenant boundaries
+- **Never expose raw database access** as a tool — wrap in a validated, scoped function
+
+## Multi-Model Provider Registry
+
+```tsx
+import { createProviderRegistry, customProvider, wrapLanguageModel } from "ai";
+import { createOpenAI } from "@ai-sdk/openai";
+import { createAnthropic } from "@ai-sdk/anthropic";
+
+export const registry = createProviderRegistry({
+  openai: createOpenAI({ apiKey: process.env.OPENAI_API_KEY }),
+  anthropic: createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY }),
+  aliases: customProvider({
+    languageModels: {
+      fast: openai("gpt-4.1-mini"),
+      default: anthropic("claude-sonnet-4-5"),
+      reasoning: anthropic("claude-sonnet-4-5", {
+        thinking: { type: "enabled", budgetTokens: 16000 },
+      }),
+    },
+  }),
+});
+
+export function getModel(alias: string) {
+  return registry.languageModel(`aliases:${alias}`);
+}
+```
+
+### Provider Rules
+- **Always use a provider registry** — even with one provider today, it makes switching trivial
+- **Define model aliases** (`fast`, `default`, `reasoning`) instead of hardcoding model names
+- **Use fallback chains** via AI Gateway `providerOptions.gateway.models` for production reliability
+- **Route simple tasks to cheaper models** (gpt-4.1-mini, haiku) and complex tasks to capable ones
+- **Never hardcode API keys** — always use environment variables
+
+## Prompt Engineering for Resume Content
+
+```tsx
+const RESUME_SYSTEM_PROMPT = `You are an expert resume writer and career coach.
+
+RULES:
+- Write in first person implied (no "I" — start bullets with strong action verbs)
+- Use the STAR method: Situation, Task, Action, Result
+- Quantify achievements with specific metrics when possible
+- Match terminology to the target industry/role
+- Keep bullet points to 1-2 lines maximum
+- Use present tense for current role, past tense for previous roles
+
+OUTPUT FORMAT:
+- Return structured JSON matching the provided schema
+- Never include personal opinions or subjective qualifiers
+- Never fabricate metrics — use placeholders like [X%] if unknown`;
+```
+
+## Error Handling
+
+```tsx
+function handleChatError(error: Error) {
+  if (error.message.includes("429")) {
+    // Rate limited — show "Please wait" with cooldown timer
+    showRateLimitToast();
+  } else if (error.message.includes("content_filter")) {
+    // Content policy — suggest rephrasing
+    showContentPolicyToast();
+  } else if (error.message.includes("context_length")) {
+    // Context too long — trim older messages
+    trimConversation();
+  } else {
+    // Network or unknown — offer retry
+    showRetryToast();
+  }
+}
+```
+
+## Stream Resumption (Long-Running Generations)
+
+For resume analysis or long agent tasks:
+- Set `resume: true` in useChat options to reconnect after page reload
+- Implement a dedicated `/api/chat/[id]/stream` GET endpoint for reconnection
+- Create a separate stop endpoint — do NOT cancel generation on tab close (that's a disconnect, not a stop)
+- Use Redis or KV for active stream tracking
+
+## Cloudflare Workers AI Integration
+
+When using Workers AI (within free tier limits):
+- Use `@ai-sdk/cloudflare` provider or OpenAI-compatible endpoint
+- Workers AI has 10K neurons/day limit — route only simple tasks to it
+- Use the provider registry to transparently route between Workers AI and external providers

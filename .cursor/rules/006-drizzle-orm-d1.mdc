@@ -1,0 +1,390 @@
+---
+description: "Drizzle ORM with Cloudflare D1/SQLite — schema design, queries, migrations, relations, and D1-specific patterns"
+globs: ["src/db/**", "**/schema.ts", "**/relations.ts", "**/drizzle.config.*", "drizzle/**", "**/migrations/**"]
+alwaysApply: false
+---
+
+# Drizzle ORM + Cloudflare D1 (SQLite) Standards
+
+## Imports — Always Use `sqlite-core`
+
+D1 is SQLite. Never import from `pg-core` or `mysql-core`.
+
+```ts
+import { sqliteTable, text, integer, blob, real, index, uniqueIndex, primaryKey } from "drizzle-orm/sqlite-core";
+import { sql, eq, and, or, gt, lt, gte, lte, ne, like, isNull, isNotNull, inArray, notInArray, desc, asc, count, sum, avg } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+import { defineRelations } from "drizzle-orm";
+```
+
+## Schema Design
+
+### Table Definitions
+
+Use `sqliteTable` with the callback syntax for indexes. Tables use **plural snake_case** names. Columns use **snake_case** in DB, **camelCase** in TypeScript:
+
+```ts
+export const users = sqliteTable("users", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  email: text("email").notNull().unique(),
+  name: text("name").notNull(),
+  role: text("role").$type<"free" | "pro" | "admin">().notNull().default("free"),
+  avatarUrl: text("avatar_url"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+}, (table) => [
+  uniqueIndex("users_email_idx").on(table.email),
+]);
+```
+
+### SQLite Column Types
+
+SQLite has limited types. Map them correctly:
+
+| TypeScript Need | Drizzle Column | Notes |
+|---|---|---|
+| String / UUID | `text("col")` | No varchar in SQLite |
+| Enum-like | `text("col").$type<"a" \| "b">()` | Use `$type<>` for type narrowing |
+| Number | `integer("col")` | Default mode is `"number"` |
+| Boolean | `integer("col", { mode: "boolean" })` | SQLite stores as 0/1 |
+| Timestamp | `integer("col", { mode: "timestamp" })` | Stores as Unix seconds |
+| Timestamp (ms) | `integer("col", { mode: "timestamp_ms" })` | Stores as Unix millis |
+| JSON data | `text("col", { mode: "json" }).$type<T>()` | Use `text` not `blob` for JSON — SQLite JSON functions require text |
+| Binary data | `blob("col")` | Buffer mode by default |
+| Decimal / Float | `real("col")` | 64-bit IEEE float |
+| Auto-increment PK | `integer("id").primaryKey({ autoIncrement: true })` | Classic integer PK |
+| UUID PK | `text("id").primaryKey().$defaultFn(() => crypto.randomUUID())` | Preferred for distributed systems |
+
+### Foreign Keys and Indexes
+
+**ALWAYS** add indexes on foreign key columns and frequently filtered/sorted columns. Drizzle `relations()` are metadata only — they do NOT create DB-level foreign keys or indexes:
+
+```ts
+export const resumes = sqliteTable("resumes", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  title: text("title").notNull(),
+  content: text("content", { mode: "json" }).$type<ResumeContent>(),
+  isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().$defaultFn(() => new Date()),
+}, (table) => [
+  index("resumes_user_id_idx").on(table.userId),
+  index("resumes_created_at_idx").on(table.createdAt),
+]);
+```
+
+### Many-to-Many Join Tables
+
+```ts
+export const resumeSkills = sqliteTable("resume_skills", {
+  resumeId: text("resume_id").notNull().references(() => resumes.id, { onDelete: "cascade" }),
+  skillId: text("skill_id").notNull().references(() => skills.id, { onDelete: "cascade" }),
+}, (table) => [
+  primaryKey({ columns: [table.resumeId, table.skillId] }),
+  index("resume_skills_resume_idx").on(table.resumeId),
+  index("resume_skills_skill_idx").on(table.skillId),
+]);
+```
+
+## Relations — Use `defineRelations` (v2 API)
+
+Define all relations in a single `relations.ts` file using `defineRelations`. Do NOT use the legacy per-table `relations()` helper for new code:
+
+```ts
+// src/db/relations.ts
+import { defineRelations } from "drizzle-orm";
+import * as schema from "./schema";
+
+export const relations = defineRelations(schema, (r) => ({
+  users: {
+    resumes: r.many.resumes(),
+    sessions: r.many.sessions(),
+  },
+  resumes: {
+    user: r.one.users({
+      from: r.resumes.userId,
+      to: r.users.id,
+    }),
+    skills: r.many.resumeSkills(),
+  },
+  resumeSkills: {
+    resume: r.one.resumes({
+      from: r.resumeSkills.resumeId,
+      to: r.resumes.id,
+    }),
+    skill: r.one.skills({
+      from: r.resumeSkills.skillId,
+      to: r.skills.id,
+    }),
+  },
+}));
+```
+
+## Database Connection (Cloudflare D1)
+
+Initialize from the D1 binding, not from a connection string:
+
+```ts
+// src/db/index.ts
+import { drizzle } from "drizzle-orm/d1";
+import * as schema from "./schema";
+import { relations } from "./relations";
+
+export function createDb(d1: D1Database) {
+  return drizzle(d1, { schema, relations });
+}
+
+export type Database = ReturnType<typeof createDb>;
+```
+
+Access in a Cloudflare Worker or Next.js on Workers:
+
+```ts
+// In a Worker fetch handler
+const db = createDb(env.DB);
+
+// In Next.js on Cloudflare (OpenNext)
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+const { env } = await getCloudflareContext({ async: true });
+const db = createDb(env.DB);
+```
+
+## Type Inference
+
+Always infer types from the schema. Never hand-write DB row types:
+
+```ts
+// Infer select and insert types from schema
+type User = typeof users.$inferSelect;
+type NewUser = typeof users.$inferInsert;
+
+// For partial updates
+type UserUpdate = Partial<Omit<NewUser, "id" | "createdAt">>;
+
+// For API responses — omit sensitive fields
+type UserPublic = Pick<User, "id" | "name" | "email" | "avatarUrl" | "role">;
+```
+
+## Query Patterns
+
+### Select
+
+```ts
+// Single row
+const user = await db.select().from(users).where(eq(users.id, userId)).get();
+
+// Multiple rows with filtering
+const proUsers = await db.select()
+  .from(users)
+  .where(and(eq(users.role, "pro"), isNotNull(users.email)))
+  .orderBy(desc(users.createdAt))
+  .all();
+
+// Select specific columns only
+const emails = await db.select({ id: users.id, email: users.email })
+  .from(users)
+  .all();
+
+// With relational query API (uses defineRelations)
+const userWithResumes = await db.query.users.findFirst({
+  where: eq(users.id, userId),
+  with: { resumes: true },
+});
+```
+
+### Insert
+
+```ts
+// Single insert
+const newUser = await db.insert(users)
+  .values({ email: "a@b.com", name: "Alice", role: "free" })
+  .returning()
+  .get();
+
+// Bulk insert
+await db.insert(users).values([
+  { email: "a@b.com", name: "Alice" },
+  { email: "b@b.com", name: "Bob" },
+]);
+
+// Upsert (insert or update on conflict)
+await db.insert(users)
+  .values({ id: existingId, email: "new@b.com", name: "Alice" })
+  .onConflictDoUpdate({
+    target: users.id,
+    set: { email: "new@b.com", updatedAt: new Date() },
+  });
+```
+
+### Update
+
+```ts
+const updated = await db.update(users)
+  .set({ role: "pro", updatedAt: new Date() })
+  .where(eq(users.id, userId))
+  .returning()
+  .get();
+```
+
+### Delete
+
+```ts
+await db.delete(users).where(eq(users.id, userId));
+```
+
+### Prepared Statements
+
+Use prepared statements for queries that run frequently (hot paths). They are compiled once and re-executed with different params:
+
+```ts
+const getUserById = db.select()
+  .from(users)
+  .where(eq(users.id, sql.placeholder("id")))
+  .prepare();
+
+const user = await getUserById.execute({ id: "abc-123" });
+```
+
+## D1-Specific: Batch API (No Transactions)
+
+**Cloudflare D1 does NOT support `BEGIN TRANSACTION`.** Use `db.batch()` for atomic multi-statement operations. All statements in a batch execute in a single round-trip and are rolled back together on failure:
+
+```ts
+// Atomic multi-statement operation
+const [newResume, updatedUser] = await db.batch([
+  db.insert(resumes).values({
+    userId,
+    title: "New Resume",
+  }).returning(),
+  db.update(users).set({
+    updatedAt: new Date(),
+  }).where(eq(users.id, userId)).returning(),
+]);
+```
+
+### Batch Rules
+
+1. **All writes that must land together go in ONE batch.** Two separate `batch()` calls are two separate transactions.
+2. **No mid-batch branching.** You cannot read a result from statement 1 and use it to decide statement 2. Do all reads and validation BEFORE constructing the batch.
+3. **Generate IDs client-side** (`crypto.randomUUID()`) so you can reference them across batch statements.
+4. **Use SQL expressions for arithmetic** — never fetch a value, do math in JS, and write it back:
+   ```ts
+   // WRONG — race condition
+   const user = await db.select().from(users).where(eq(users.id, id)).get();
+   await db.update(users).set({ credits: user.credits - 1 }).where(eq(users.id, id));
+
+   // CORRECT — atomic SQL expression inside batch
+   await db.batch([
+     db.update(users)
+       .set({ credits: sql`${users.credits} - 1` })
+       .where(and(eq(users.id, id), gt(users.credits, 0))),
+   ]);
+   ```
+5. **For complex interdependent transactions**, consider Durable Objects (each DO has its own isolated SQLite with real transaction support).
+
+## D1-Specific: Sessions API (Read-After-Write Consistency)
+
+D1 uses global read replication. If you write and immediately read, the read might hit a stale replica. Use the Sessions API for read-after-write consistency:
+
+```ts
+const session = env.DB.withSession();
+await createDb(session).insert(users).values({ ... });
+const bookmark = session.getBookmark();
+// Pass bookmark to subsequent requests for consistent reads
+```
+
+## Migration Workflow
+
+### Config
+
+```ts
+// drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./src/db/schema.ts",
+  dialect: "sqlite",
+  driver: "d1-http",
+  dbCredentials: {
+    accountId: process.env.CLOUDFLARE_ACCOUNT_ID!,
+    databaseId: process.env.CLOUDFLARE_DATABASE_ID!,
+    token: process.env.CLOUDFLARE_D1_TOKEN!,
+  },
+});
+```
+
+### Commands
+
+```bash
+# Generate migration from schema changes
+npx drizzle-kit generate
+
+# Preview SQL that push would execute (no apply)
+npx drizzle-kit push --explain
+
+# Apply to local D1 during development
+npx wrangler d1 migrations apply DB --local
+
+# Apply to remote production D1
+npx wrangler d1 migrations apply DB --remote
+
+# Pull existing DB schema into Drizzle format
+npx drizzle-kit pull
+```
+
+**Rules:**
+- Use `drizzle-kit generate` and commit the resulting SQL file in `drizzle/` alongside the schema change in the same PR.
+- Use `drizzle-kit push` ONLY for local throwaway prototyping. It overwrites the DB schema without recording a migration file.
+- Apply migrations with `wrangler d1 migrations apply` in CI/CD.
+- Never modify generated migration files by hand unless absolutely necessary.
+
+## File Structure
+
+```
+src/
+  db/
+    schema.ts         # All table definitions
+    relations.ts      # defineRelations (v2)
+    index.ts          # createDb() factory
+    queries/          # Reusable query functions
+      users.ts
+      resumes.ts
+drizzle/
+  0000_*.sql          # Generated migrations
+  meta/               # Migration metadata
+drizzle.config.ts     # drizzle-kit config
+```
+
+## Anti-Patterns — NEVER Do These
+
+1. **Never use `db.transaction()`** with D1 — it throws. Use `db.batch()`.
+2. **Never use `PRAGMA` statements** — D1 manages them. Foreign keys are ON by default.
+3. **Never import from `pg-core` or `mysql-core`** — D1 is SQLite.
+4. **Never write N+1 loops** — use `db.query.*.findMany({ with: { ... } })` or JOINs.
+5. **Never skip indexes on foreign keys** — `relations()` / `defineRelations` are metadata only.
+6. **Never use `blob` for JSON storage** — use `text("col", { mode: "json" })` so SQLite JSON functions work.
+7. **Never do read-modify-write in separate queries** — use SQL expressions (`sql\`col - 1\``) inside a batch.
+8. **Never hand-write DB row types** — always use `$inferSelect` / `$inferInsert`.
+9. **Never use the legacy per-table `relations()` for new code** — use `defineRelations` in a single file.
+10. **Never use `process.env` for D1 bindings** — access via `env.DB` from the Cloudflare runtime context.
+
+## Validation with Zod
+
+Generate Zod schemas from Drizzle tables for API input validation:
+
+```ts
+import { createInsertSchema, createSelectSchema } from "drizzle-zod";
+import { z } from "zod";
+
+export const insertUserSchema = createInsertSchema(users, {
+  email: z.string().email(),
+  name: z.string().min(1).max(100),
+  role: z.enum(["free", "pro", "admin"]).optional(),
+});
+
+export const selectUserSchema = createSelectSchema(users);
+
+export type InsertUser = z.infer<typeof insertUserSchema>;
+```

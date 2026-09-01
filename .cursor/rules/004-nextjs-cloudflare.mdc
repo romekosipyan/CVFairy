@@ -1,0 +1,526 @@
+---
+description: "Next.js on Cloudflare Workers — architecture, bindings, deployment, and free-tier constraints for CVFairy"
+globs: ["wrangler.jsonc", "wrangler.toml", "next.config.*", "open-next.config.*", "src/lib/db/**", "src/app/api/**", "src/middleware.ts", "src/proxy.ts"]
+alwaysApply: false
+---
+
+# Next.js on Cloudflare — CVFairy Project Rules
+
+## Stack Overview
+
+| Layer | Technology | Notes |
+|-------|-----------|-------|
+| Framework | Next.js 16 (App Router) | TypeScript strict mode |
+| Deployment | Cloudflare Workers via **vinext** (preferred) or **@opennextjs/cloudflare** (stable fallback) | NOT `@cloudflare/next-on-pages` — archived Sept 2025 |
+| Database | Cloudflare D1 (SQLite) | Via binding `env.DB` |
+| ORM | Drizzle ORM (`drizzle-orm/d1`) | Drizzle Kit with `d1-http` driver for migrations |
+| Object Storage | Cloudflare R2 | Via binding `env.R2` — zero egress fees |
+| KV Cache | Cloudflare Workers KV | Via binding `env.KV` |
+| AI | Cloudflare Workers AI | Via binding `env.AI` |
+| CSS | Tailwind CSS v4 | |
+| Testing | Vitest + Miniflare | Workers-native test environment |
+| Config | `wrangler.jsonc` | Preferred over `wrangler.toml` for new projects |
+
+## Deployment Path Decision
+
+### vinext (Recommended for new projects)
+Cloudflare's Vite-based reimplementation of the Next.js API surface. Faster builds, smaller bundles, native Workers integration.
+
+```bash
+npx vinext init --platform=cloudflare   # migrate existing project
+npx @vinext/cloudflare deploy           # build + deploy in one command
+```
+
+### @opennextjs/cloudflare (Stable fallback)
+Use when vinext has a compatibility gap with a specific Next.js feature you need.
+
+```bash
+npx @opennextjs/cloudflare build        # build
+npx wrangler deploy                      # deploy
+```
+
+### NEVER use `@cloudflare/next-on-pages`
+Archived September 2025. Does not support Next.js 15+, ISR, or modern features.
+
+---
+
+## Cloudflare Free Tier Limits (enforce these constraints)
+
+All daily limits reset at 00:00 UTC.
+
+| Service | Free Tier Limit | Key Constraint |
+|---------|----------------|----------------|
+| **Workers** | 100K requests/day, 10ms CPU/request | 3 MiB compressed bundle, 50 subrequests/invocation |
+| **D1** | 5M rows read/day, 100K rows written/day | 5 GB total storage |
+| **R2** | 10 GB storage, 1M Class A ops/mo, 10M Class B ops/mo | Zero egress fees |
+| **KV** | 100K reads/day, 1K writes/day | 1 GB storage |
+| **Workers AI** | 10K neurons/day | Shared across all models; large models burn faster |
+| **Pages** | 500 builds/month | 20K static asset files |
+| **Worker size** | 3 MiB (free), 10 MiB (paid) | After gzip compression |
+
+### Staying Within Free Tier
+
+- Use `force-static` or `force-dynamic` explicitly on every route — never let Next.js guess.
+- Prefer R2 over KV for storing anything larger than 25 KB (KV value limit is 25 MiB but writes are expensive at 1K/day).
+- Use D1 `batch()` for atomic multi-statement operations — one batch = one write toward the daily limit.
+- Cache aggressively with `Cache-Control` headers to reduce Worker invocations.
+- For Workers AI: prefer small models (Llama 3.2 1B ≈ 5.6 neurons/request) over large ones (Llama 3.1 70B ≈ 62 neurons/request).
+- Monitor usage via Cloudflare Dashboard > Workers & Pages > Metrics.
+
+---
+
+## Runtime Environment Rules
+
+### Compatibility Configuration (2026)
+
+For `compatibility_date` of `2026-08-04` or later, `nodejs_compat` is **enabled by default** — no flags needed.
+
+```jsonc
+{
+  // For compatibility_date >= 2026-08-04: nodejs_compat is automatic
+  "compatibility_date": "2026-09-01"
+
+  // For compatibility_date < 2026-08-04, you must add:
+  // "compatibility_flags": ["nodejs_compat"]
+}
+```
+
+### What Works in the Workers Runtime
+
+Most Node.js APIs now work natively (node:crypto, node:buffer, node:stream, node:net, node:dns, node:fs, node:http).
+Remaining gaps are polyfilled by `unenv` at build time via Wrangler.
+
+### What Does NOT Work
+
+- **No filesystem persistence** — `node:fs` exists but is in-memory only, not backed by a real filesystem.
+- **No long-running processes** — 10ms CPU (free) or 30s wall-clock. Design for request/response.
+- **No native binaries** — packages relying on `.node` addons (bcrypt, sharp, canvas) will fail. Use alternatives:
+  - `bcrypt` → `bcryptjs` or Web Crypto `PBKDF2`/`scrypt`
+  - `sharp` → Cloudflare Images or `@cf/image/...` Workers AI model
+  - `jsonwebtoken` → `jose` (Web Crypto based)
+  - `uuid` → `crypto.randomUUID()` (native)
+- **No `process.env` in runtime code** — use `env` parameter from bindings (OpenNext/vinext bridges this, but be explicit).
+- **128 MB memory limit** per isolate.
+- **50 subrequests** per invocation on free plan (D1, KV, R2, fetch all count).
+
+---
+
+## Environment Variables & Secrets
+
+### Non-sensitive values → `wrangler.jsonc` `vars` section
+```jsonc
+{
+  "vars": {
+    "NEXT_PUBLIC_APP_NAME": "CVFairy",
+    "ENVIRONMENT": "production"
+  }
+}
+```
+
+### Sensitive values → `wrangler secret put`
+```bash
+wrangler secret put AUTH_SECRET
+wrangler secret put OPENAI_API_KEY
+```
+
+### Local development → `.dev.vars` file (gitignored)
+```
+AUTH_SECRET=dev-secret-value
+CLOUDFLARE_ACCOUNT_ID=abc123
+CLOUDFLARE_D1_TOKEN=xyz789
+```
+
+### Accessing bindings in Next.js
+
+With **@opennextjs/cloudflare**:
+```typescript
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+
+export async function GET() {
+  const { env } = await getCloudflareContext();
+  const db = drizzle(env.DB);
+  // ...
+}
+```
+
+With **vinext**:
+```typescript
+import { getCloudflareContext } from "cloudflare:workers";
+
+export async function GET() {
+  const { env } = getCloudflareContext();
+  const db = drizzle(env.DB);
+  // ...
+}
+```
+
+### Type-safe bindings
+Run `wrangler types` to auto-generate `worker-configuration.d.ts`, then reference it:
+```typescript
+// env.d.ts
+interface CloudflareEnv {
+  DB: D1Database;
+  KV: KVNamespace;
+  R2: R2Bucket;
+  AI: Ai;
+  AUTH_SECRET: string;
+}
+```
+
+---
+
+## D1 Database (SQLite) Best Practices
+
+### Schema with Drizzle ORM
+```typescript
+// lib/db/schema.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+
+export const users = sqliteTable("users", {
+  id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  email: text("email").notNull().unique(),
+  name: text("name").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .$defaultFn(() => new Date()),
+});
+```
+
+### Drizzle config for migrations
+```typescript
+// drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+export default defineConfig({
+  schema: "./lib/db/schema.ts",
+  out: "./drizzle",
+  dialect: "sqlite",
+  driver: "d1-http",
+  dbCredentials: {
+    accountId: process.env.CLOUDFLARE_ACCOUNT_ID!,
+    databaseId: process.env.D1_DATABASE_ID!,
+    token: process.env.CLOUDFLARE_D1_TOKEN!,
+  },
+});
+```
+
+### Query patterns
+
+```typescript
+import { drizzle } from "drizzle-orm/d1";
+import * as schema from "@/lib/db/schema";
+
+function getDb(env: CloudflareEnv) {
+  return drizzle(env.DB, { schema });
+}
+
+// Always use prepared statements (parameterized queries)
+const user = await db.select().from(schema.users)
+  .where(eq(schema.users.email, email))
+  .get();
+
+// Batch for atomic multi-statement ops (counts as one write)
+await db.batch([
+  db.insert(schema.users).values({ name: "Alice", email: "a@b.com" }),
+  db.insert(schema.profiles).values({ userId: id, bio: "Hello" }),
+]);
+```
+
+### D1 Rules
+- **Always index columns used in WHERE, JOIN, ORDER BY** — D1 has no query optimizer hints.
+- **Use `db.batch()`** for multi-statement atomicity — D1 does not support interactive transactions.
+- **Generate IDs client-side** with `crypto.randomUUID()` — avoids extra round-trips.
+- **Use parameterized queries ALWAYS** — NEVER concatenate user input into SQL strings.
+- **No FTS5** — D1 does not support SQLite full-text search. Use Vectorize or external search.
+- **Chunk bulk mutations** — batch large inserts in groups of 50-100 to stay within row-write limits.
+- **Use `RETURNING`** to avoid separate SELECT after INSERT/UPDATE.
+
+### Migrations workflow
+```bash
+# Generate migration from schema changes
+npx drizzle-kit generate
+
+# Apply to local D1 (via wrangler)
+npx wrangler d1 migrations apply DB --local
+
+# Apply to remote D1
+npx wrangler d1 migrations apply DB --remote
+
+# Explore with Drizzle Studio
+npx drizzle-kit studio
+```
+
+---
+
+## R2 Object Storage Patterns
+
+```typescript
+// Upload
+async function uploadFile(env: CloudflareEnv, key: string, body: ReadableStream, contentType: string) {
+  await env.R2.put(key, body, {
+    httpMetadata: { contentType },
+  });
+}
+
+// Download
+async function getFile(env: CloudflareEnv, key: string) {
+  const object = await env.R2.get(key);
+  if (!object) return new Response("Not found", { status: 404 });
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": object.httpMetadata?.contentType ?? "application/octet-stream",
+      "Cache-Control": "public, max-age=86400",
+    },
+  });
+}
+
+// Delete
+async function deleteFile(env: CloudflareEnv, key: string) {
+  await env.R2.delete(key);
+}
+
+// List with prefix
+const listed = await env.R2.list({ prefix: `users/${userId}/` });
+```
+
+### R2 Rules
+- Use structured key prefixes: `users/{userId}/resumes/{filename}`
+- Set `Cache-Control` headers for browser caching.
+- Prefer R2 over KV for files > 25 KB.
+- R2 Class A ops (PUT, DELETE, LIST) cost more — minimize list operations.
+- Maximum object size: 5 TB. Maximum key length: 1024 bytes.
+
+---
+
+## KV Store Patterns
+
+```typescript
+// Simple get/put
+const value = await env.KV.get("session:abc123", "json");
+await env.KV.put("session:abc123", JSON.stringify(data), {
+  expirationTtl: 3600,  // 1 hour TTL in seconds
+});
+
+// Delete
+await env.KV.delete("session:abc123");
+
+// List keys with prefix
+const keys = await env.KV.list({ prefix: "session:" });
+```
+
+### KV Rules
+- KV is **eventually consistent** — writes propagate globally in ~60 seconds.
+- Use for caching, session tokens, feature flags — NOT as a primary database.
+- 1K writes/day on free tier — do NOT use for high-write scenarios.
+- Max value size: 25 MiB. Max key size: 512 bytes.
+- Always set `expirationTtl` to prevent unbounded storage growth.
+- LIST operations count toward writes quota.
+
+---
+
+## Workers AI Patterns
+
+```typescript
+export async function POST(request: Request) {
+  const { env } = await getCloudflareContext();
+  const { prompt } = await request.json();
+
+  const response = await env.AI.run("@cf/meta/llama-3.2-1b-instruct", {
+    messages: [
+      { role: "system", content: "You are a helpful career advisor." },
+      { role: "user", content: prompt },
+    ],
+    max_tokens: 512,
+  });
+
+  return Response.json(response);
+}
+```
+
+### Workers AI Rules
+- 10K neurons/day shared across ALL models. Budget per feature.
+- Small models (~5 neurons/request) vs large models (~60 neurons/request) — pick intentionally.
+- Handle error code 3036 (HTTP 429) = daily neuron limit exceeded. Show graceful fallback.
+- Use streaming responses for better UX: `stream: true` option.
+- Text embeddings cost ~1-5 neurons/request — efficient for search.
+- Image generation costs ~300-500 neurons/call — extremely expensive on free tier.
+
+---
+
+## Bundle Size Optimization (Critical for 3 MiB free limit)
+
+- Use `serverExternalPackages` in `next.config.ts` to exclude build-only packages:
+  ```typescript
+  // next.config.ts
+  const nextConfig: NextConfig = {
+    serverExternalPackages: [
+      "rehype-pretty-code",
+      "shiki",
+      "@mdx-js/mdx",
+    ],
+  };
+  ```
+- Import only what you need: `import { eq } from "drizzle-orm"` not `import * as drizzle from "drizzle-orm"`.
+- Avoid importing `next/og` if not using dynamic OG images (it bundles 2 WASM files).
+- Use `dynamic = "force-static"` on all static pages to prevent SSR code from entering the bundle.
+- Monitor bundle size: check `.open-next/worker.js` after build.
+- If exceeding 3 MiB, consider the Workers Paid plan ($5/mo) for 10 MiB limit.
+
+---
+
+## Middleware Constraints
+
+Next.js middleware runs in the **Edge Runtime** on every request:
+
+- Keep middleware lightweight — it runs on EVERY request and counts toward CPU limits.
+- **No D1 bindings in middleware** (via OpenNext) — move database checks to route handlers.
+- **No heavy Node.js imports** — middleware uses the Workers edge subset.
+- Good middleware uses: redirects, rewrites, header manipulation, cookie checks, geo-routing.
+- Bad middleware uses: database queries, AI calls, complex auth validation.
+
+```typescript
+// middleware.ts — keep it thin
+import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+export function middleware(request: NextRequest) {
+  const isAuthenticated = request.cookies.has("session");
+  if (!isAuthenticated && request.nextUrl.pathname.startsWith("/dashboard")) {
+    return NextResponse.redirect(new URL("/login", request.url));
+  }
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/api/:path*"],
+};
+```
+
+---
+
+## Project Structure
+
+```
+CVFairy/
+├── app/                        # Next.js App Router
+│   ├── (auth)/                 # Auth route group
+│   │   ├── login/page.tsx
+│   │   └── register/page.tsx
+│   ├── (dashboard)/            # Authenticated route group
+│   │   └── dashboard/page.tsx
+│   ├── api/                    # API route handlers
+│   │   └── [...route]/route.ts
+│   ├── layout.tsx
+│   ├── page.tsx
+│   └── globals.css
+├── lib/
+│   ├── db/
+│   │   ├── schema.ts           # Drizzle schema definitions
+│   │   ├── index.ts            # DB client factory
+│   │   └── migrations/         # Generated by drizzle-kit
+│   ├── r2/                     # R2 helper functions
+│   ├── kv/                     # KV helper functions
+│   ├── ai/                     # Workers AI wrappers
+│   └── utils.ts
+├── components/                 # React components
+│   ├── ui/                     # Shared UI components
+│   └── ...
+├── drizzle/                    # Migration SQL files (generated)
+├── public/                     # Static assets
+├── wrangler.jsonc              # Cloudflare configuration (source of truth)
+├── next.config.ts              # Next.js configuration
+├── vite.config.ts              # If using vinext
+├── drizzle.config.ts           # Drizzle Kit configuration
+├── .dev.vars                   # Local secrets (gitignored)
+├── worker-configuration.d.ts   # Auto-generated types (wrangler types)
+├── tailwind.config.ts
+├── tsconfig.json
+└── package.json
+```
+
+---
+
+## Build & Deploy Workflow
+
+### Local Development
+```bash
+# With vinext
+npx vinext dev                         # Vite dev server with Workers bindings
+
+# With OpenNext
+npx next dev                           # Next.js dev server
+npx wrangler dev                       # Preview in Workers runtime (run separately)
+
+# Apply D1 migrations locally
+npx wrangler d1 migrations apply DB --local
+```
+
+### Production Deploy
+```bash
+# With vinext (one command)
+npx @vinext/cloudflare deploy
+
+# With OpenNext
+npx @opennextjs/cloudflare build && npx wrangler deploy
+
+# Deploy via CI (GitHub Actions)
+# Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as secrets
+```
+
+### Preview Deployments
+```bash
+# Deploy to preview URL
+npx wrangler deploy --env preview
+```
+
+---
+
+## Testing
+
+```typescript
+// Use @cloudflare/vitest-pool-workers for Workers-native tests
+// vitest.config.ts
+import { defineWorkersConfig } from "@cloudflare/vitest-pool-workers/config";
+
+export default defineWorkersConfig({
+  test: {
+    poolOptions: {
+      workers: {
+        wrangler: { configPath: "./wrangler.jsonc" },
+      },
+    },
+  },
+});
+```
+
+---
+
+## Anti-Patterns (NEVER Do These)
+
+1. **NEVER use `@cloudflare/next-on-pages`** — deprecated and archived.
+2. **NEVER use `process.env` at runtime** — use `env` from bindings context.
+3. **NEVER store secrets in `wrangler.jsonc`** — use `wrangler secret put`.
+4. **NEVER concatenate user input into SQL** — always use parameterized queries.
+5. **NEVER import native Node.js binary packages** (bcrypt, sharp, canvas).
+6. **NEVER rely on in-memory state across requests** — Workers are stateless.
+7. **NEVER use `export const runtime = "edge"` with OpenNext** — it uses Node runtime mode.
+8. **NEVER deploy from local machine in production** — use CI/CD to avoid chunk mismatch.
+9. **NEVER run D1 queries in middleware** — bindings aren't available in middleware context.
+10. **NEVER exceed 50 subrequests per invocation** (free tier) — batch where possible.
+
+---
+
+## Cloudflare-Compatible Package Alternatives
+
+| Instead of | Use | Reason |
+|-----------|-----|--------|
+| `bcrypt` | `bcryptjs` or Web Crypto PBKDF2 | No native binaries |
+| `sharp` | Cloudflare Images / Workers AI | No native binaries |
+| `jsonwebtoken` | `jose` | Web Crypto based |
+| `uuid` | `crypto.randomUUID()` | Built-in to Workers runtime |
+| `axios` | `fetch` (native) | Built-in, zero bundle cost |
+| `node-fetch` | `fetch` (native) | Built-in globally |
+| `prisma` | `drizzle-orm` | Lighter bundle, native D1 support |
+| `fs` (persistence) | R2 or KV | No real filesystem in Workers |
+| `redis` | KV or Durable Objects | Native Cloudflare alternatives |
+| `bull/bullmq` | Cloudflare Queues | Native serverless queues |
+| `socket.io` | Durable Objects WebSocket | Native WebSocket support |

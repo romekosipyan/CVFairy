@@ -1,0 +1,98 @@
+---
+description: "Core project rules for CVFairy - always active for every file in the project"
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# CVFairy — Core Project Rules
+
+## Project Identity
+- **Product:** CVFairy — AI-powered resume builder SaaS
+- **Stack:** Next.js 16 (App Router) + React 19 + TypeScript + Tailwind CSS 4 + shadcn/ui
+- **Deployment:** Cloudflare Pages (free tier) with D1, R2, KV
+- **Architecture:** Local-first (IndexedDB default, optional cloud sync)
+
+## Agentic SDLC
+Before implementing any feature, follow the agentic SDLC:
+1. Read the task spec in `docs/knowledge-base/tasks/`
+2. Verify the plan exists and dependencies are met
+3. Implement step-by-step per the plan
+4. Verify against acceptance criteria
+5. Update knowledge base nodes
+6. Commit with conventional commit message
+
+## Absolute Rules
+- TypeScript strict mode everywhere — no `any`, no `as` casts unless unavoidable (add comment explaining why)
+- No `console.log` in committed code — use structured logging or remove
+- No hardcoded secrets, API keys, or credentials — use environment variables
+- No TODO/FIXME in shipped code — create a task node in `docs/knowledge-base/tasks/` instead
+- Every function that can fail MUST handle errors explicitly (try/catch or Result type)
+- Prefer early returns over nested conditionals
+- Max function length: ~50 lines. Extract helpers if longer.
+- Max file length: ~300 lines. Split into modules if longer.
+
+## File Naming Conventions
+- Components: `PascalCase.tsx` (e.g., `ResumeEditor.tsx`)
+- Hooks: `use-kebab-case.ts` (e.g., `use-resume-store.ts`)
+- Utilities: `kebab-case.ts` (e.g., `pdf-export.ts`)
+- Types/schemas: `kebab-case.ts` in a `types/` or `schemas/` directory
+- Constants: `kebab-case.ts` (e.g., `template-defaults.ts`)
+- Route files: follow Next.js conventions (`page.tsx`, `layout.tsx`, `loading.tsx`, `error.tsx`)
+
+## Import Order
+1. React/Next.js imports
+2. Third-party library imports
+3. Internal aliases (`@/` prefix)
+4. Relative imports
+5. Type-only imports last
+
+## Directory Structure
+```
+src/
+  app/                    # Next.js App Router pages and layouts
+    (marketing)/          # Marketing pages (landing, pricing, etc.)
+    (app)/                # Authenticated app pages (editor, dashboard)
+    api/                  # API route handlers
+  components/
+    ui/                   # shadcn/ui base components
+    resume/               # Resume-specific components
+    editor/               # Editor-specific components
+    shared/               # Shared/layout components
+  lib/                    # Core business logic
+    schemas/              # Zod schemas (source of truth for types)
+    stores/               # Zustand stores
+    hooks/                # Custom React hooks
+    utils/                # Pure utility functions
+    ai/                   # AI integration (prompts, SDK config)
+    export/               # PDF, DOCX, HTML export engines
+    db/                   # Drizzle schema and queries
+    auth/                 # Auth.js configuration
+    stripe/               # Stripe integration
+  templates/              # Resume template definitions
+  i18n/                   # Internationalization messages
+docs/
+  knowledge-base/         # Obsidian-style knowledge graph
+    tasks/                # Task specifications
+    architecture/         # Architecture decision records
+    requirements/         # Feature requirements
+  sdlc/                   # SDLC methodology docs
+  architecture/           # System architecture diagrams
+```
+
+## Environment Variables
+- Prefix client-safe vars with `NEXT_PUBLIC_`
+- All secrets go in `.dev.vars` (Cloudflare local) or Cloudflare dashboard (production)
+- Never commit `.dev.vars` or `.env.local`
+
+## Git Conventions
+- Branch naming: `feat/short-description`, `fix/short-description`, `chore/short-description`
+- Commit format: conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`)
+- Keep commits atomic — one logical change per commit
+
+## Cloudflare Free Tier Limits (Stay Within These)
+- D1: 5GB storage, 5M rows read/day, 100K rows written/day
+- R2: 10GB storage, 1M Class A ops/month, 10M Class B ops/month
+- KV: 100K reads/day, 1K writes/day, 1GB storage
+- Workers: 100K requests/day, 10ms CPU time/invocation
+- Pages: 500 builds/month, 1 build at a time
+- Workers AI: 10K neurons/day

@@ -1,0 +1,359 @@
+---
+description: "Rules for Tiptap rich text editor — setup, extensions, content serialization, toolbar patterns, and performance"
+globs: ["src/components/editor/**/*.{ts,tsx}", "src/lib/editor/**/*.{ts,tsx}", "src/lib/extensions/**/*.{ts,tsx}"]
+alwaysApply: false
+---
+
+# Tiptap Editor — Rich Text Editor Rules
+
+## Installation
+
+Core packages:
+- `@tiptap/react` — React bindings and core functionality
+- `@tiptap/pm` — ProseMirror dependencies (required)
+- `@tiptap/starter-kit` — Common extensions bundle (paragraphs, headings, bold, italic, lists, history)
+- `@tiptap/extensions` — All official extensions (install individually for smaller bundles)
+
+## Editor Setup
+
+### Hook-Based Approach (Simple UIs)
+
+```tsx
+import { useEditor, EditorContent } from "@tiptap/react";
+import StarterKit from "@tiptap/starter-kit";
+import Placeholder from "@tiptap/extension-placeholder";
+
+interface ResumeEditorProps {
+  content?: string;
+  onChange?: (html: string, json: JSONContent) => void;
+  editable?: boolean;
+}
+
+export function ResumeEditor({ content = "", onChange, editable = true }: ResumeEditorProps) {
+  const editor = useEditor({
+    extensions: [
+      StarterKit.configure({
+        heading: { levels: [1, 2, 3] },
+      }),
+      Placeholder.configure({
+        placeholder: "Start writing...",
+      }),
+    ],
+    content,
+    editable,
+    immediatelyRender: false, // REQUIRED for SSR/Next.js — prevents hydration mismatch
+    editorProps: {
+      attributes: {
+        class: "prose prose-slate max-w-none focus:outline-none min-h-[200px] p-4",
+      },
+    },
+    onUpdate: ({ editor }) => {
+      onChange?.(editor.getHTML(), editor.getJSON());
+    },
+  });
+
+  if (!editor) return null;
+
+  return (
+    <div className="border rounded-lg bg-white shadow-sm">
+      {editable && <Toolbar editor={editor} />}
+      <EditorContent editor={editor} />
+    </div>
+  );
+}
+```
+
+### Composable API (Complex UIs with Many Child Components)
+
+```tsx
+import { Tiptap, useEditor } from "@tiptap/react";
+import { BubbleMenu, FloatingMenu } from "@tiptap/react/menus";
+
+function ComplexEditor() {
+  const editor = useEditor({
+    extensions: [StarterKit],
+    content: "<p>Hello</p>",
+    immediatelyRender: false,
+  });
+
+  if (!editor) return null;
+
+  return (
+    <Tiptap editor={editor}>
+      <Tiptap.Content />
+      <BubbleMenu editor={editor}>
+        <FormatToolbar />
+      </BubbleMenu>
+      <FloatingMenu editor={editor}>
+        <InsertMenu />
+      </FloatingMenu>
+    </Tiptap>
+  );
+}
+```
+
+### When to Use Each
+| Feature | Composable API | Hook-Based |
+|---------|---------------|------------|
+| Setup complexity | Low — declarative | Medium — manual prop passing |
+| Context management | Automatic | Manual via EditorContext.Provider |
+| Child component access | Easy via `useTiptap()` | Requires prop drilling or context |
+| Best for | Complex UIs with toolbars, sidebars, menus | Simple UIs or direct control |
+
+## SSR / Next.js Rules
+
+- **Always set `immediatelyRender: false`** — prevents the editor from rendering on the server
+- **Always add `if (!editor) return null`** guard before rendering
+- **Never import Tiptap in server components** — use `"use client"` directive
+- **For server-side HTML generation**, use `generateHTML` from `@tiptap/html` (NOT from `@tiptap/core`)
+
+## Extension Configuration
+
+```tsx
+import StarterKit from "@tiptap/starter-kit";
+import Link from "@tiptap/extension-link";
+import Image from "@tiptap/extension-image";
+import Table from "@tiptap/extension-table";
+import TableRow from "@tiptap/extension-table-row";
+import TableCell from "@tiptap/extension-table-cell";
+import TableHeader from "@tiptap/extension-table-header";
+import { Gapcursor } from "@tiptap/extensions";
+
+const extensions = [
+  StarterKit.configure({
+    heading: { levels: [1, 2, 3] },
+    // Disable built-in extensions you'll replace with custom ones:
+    // codeBlock: false,
+  }),
+  Link.configure({
+    openOnClick: false,
+    autolink: true,
+    HTMLAttributes: { class: "text-blue-600 underline cursor-pointer" },
+  }),
+  Image.configure({
+    inline: false,
+    allowBase64: false,
+  }),
+  Table.configure({ resizable: true }),
+  TableRow,
+  TableHeader,
+  TableCell,
+  Gapcursor, // prevents cursor from getting stuck after tables
+];
+```
+
+## Custom Extensions
+
+```tsx
+import { Node, mergeAttributes } from "@tiptap/core";
+import { ReactNodeViewRenderer } from "@tiptap/react";
+import { NodeViewWrapper, NodeViewContent } from "@tiptap/react";
+
+const ResumeSection = Node.create({
+  name: "resumeSection", // used as type key in JSON — NEVER rename in production without migration
+  group: "block",
+  content: "block+",
+
+  addAttributes() {
+    return {
+      sectionType: {
+        default: "experience",
+        parseHTML: (element) => element.getAttribute("data-section-type"),
+        renderHTML: (attributes) => ({ "data-section-type": attributes.sectionType }),
+      },
+    };
+  },
+
+  parseHTML() {
+    return [{ tag: 'div[data-type="resume-section"]' }];
+  },
+
+  renderHTML({ HTMLAttributes }) {
+    return ["div", mergeAttributes({ "data-type": "resume-section" }, HTMLAttributes), 0];
+  },
+
+  addNodeView() {
+    return ReactNodeViewRenderer(ResumeSectionView);
+  },
+});
+
+function ResumeSectionView({ node, updateAttributes }: NodeViewProps) {
+  return (
+    <NodeViewWrapper className="resume-section border-l-2 border-blue-500 pl-4 my-4">
+      <div className="text-xs text-gray-400 uppercase mb-2">{node.attrs.sectionType}</div>
+      <NodeViewContent className="content" />
+    </NodeViewWrapper>
+  );
+}
+```
+
+### Custom Extension Rules
+- **`name` is your data contract** — once documents are stored, renaming requires a content migration
+- **Design the schema first** — changing attributes or content rules later means migrating stored documents
+- **Sanitize user input in `renderHTML`** — never trust `href`, `src`, or `style` attributes from pasted content
+- **Use `transformPastedHTML`** to sanitize clipboard data before it enters the document
+- **Use `mergeAttributes`** for composing HTML attributes safely
+- **Store a version number** in document metadata for future migration support
+
+## Content Serialization
+
+### Client-Side (Browser)
+
+```tsx
+// Get content
+const json = editor.getJSON();     // JSONContent — preferred for storage
+const html = editor.getHTML();     // HTML string — useful for email/export
+const text = editor.getText();     // Plain text — useful for search indexing
+
+// Set content
+editor.commands.setContent(json);   // from JSON
+editor.commands.setContent(html);   // from HTML
+editor.commands.clearContent();     // empty the editor
+```
+
+### Server-Side (Node.js / Edge)
+
+```tsx
+// IMPORTANT: use @tiptap/html for server — @tiptap/core is browser-only
+import { generateHTML, generateJSON } from "@tiptap/html";
+import StarterKit from "@tiptap/starter-kit";
+
+// Must pass the SAME extensions the editor uses
+const extensions = [StarterKit, Link, Image];
+
+const html = generateHTML(jsonContent, extensions);
+const json = generateJSON(htmlString, extensions);
+```
+
+### Static Rendering (for SSR/React)
+
+```tsx
+import { renderToReactElement } from "@tiptap/static-renderer";
+
+// Converts ProseMirror JSON directly to React elements — no dangerouslySetInnerHTML needed
+const element = renderToReactElement(jsonContent, extensions);
+```
+
+### Serialization Rules
+- **Always pass the same extension array** to `generateHTML`/`generateJSON` that the editor uses — missing extensions silently drop content
+- **`generateHTML` from `@tiptap/core`** is browser-only; **`generateHTML` from `@tiptap/html`** works on server
+- **Prefer JSON for storage** — easier to query, transform, and migrate
+- **Use `@tiptap/static-renderer`** for SSR to avoid `dangerouslySetInnerHTML`
+- **NodeView wrappers are NOT included** in `generateHTML` output — style against static output, not editor view
+
+## Toolbar Pattern
+
+```tsx
+import { type Editor } from "@tiptap/react";
+
+interface ToolbarProps {
+  editor: Editor;
+}
+
+export function Toolbar({ editor }: ToolbarProps) {
+  return (
+    <div className="flex flex-wrap gap-1 border-b p-2">
+      <ToolbarButton
+        onClick={() => editor.chain().focus().toggleBold().run()}
+        isActive={editor.isActive("bold")}
+        label="Bold"
+      />
+      <ToolbarButton
+        onClick={() => editor.chain().focus().toggleItalic().run()}
+        isActive={editor.isActive("italic")}
+        label="Italic"
+      />
+      <ToolbarButton
+        onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
+        isActive={editor.isActive("heading", { level: 2 })}
+        label="H2"
+      />
+      <ToolbarButton
+        onClick={() => editor.chain().focus().toggleBulletList().run()}
+        isActive={editor.isActive("bulletList")}
+        label="List"
+      />
+    </div>
+  );
+}
+
+function ToolbarButton({ onClick, isActive, label }: {
+  onClick: () => void;
+  isActive: boolean;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "px-2 py-1 rounded text-sm",
+        isActive ? "bg-blue-100 text-blue-700" : "hover:bg-gray-100"
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+```
+
+### Toolbar Rules
+- **Always call `.focus()` before commands** — clicking a toolbar button moves focus out of the editor
+- **Use `.chain()...run()`** to batch multiple commands in one transaction
+- **Use `editor.isActive()`** to reflect current formatting state in the toolbar UI
+- **Use `editor.can().chain().focus().toggleBold().run()`** to disable buttons when a command can't apply
+
+## Performance
+
+### useEditorState (Hook-Based)
+
+```tsx
+import { useEditorState } from "@tiptap/react";
+
+function FormattingIndicator({ editor }: { editor: Editor }) {
+  const { isBold, isItalic } = useEditorState({
+    editor,
+    selector: (ctx) => ({
+      isBold: ctx.editor.isActive("bold"),
+      isItalic: ctx.editor.isActive("italic"),
+    }),
+  });
+  // Only re-renders when bold/italic state actually changes
+}
+```
+
+### useTiptapState (Composable API)
+
+```tsx
+import { useTiptapState } from "@tiptap/react";
+
+function FormattingIndicator() {
+  const isBold = useTiptapState((ctx) => ctx.editor.isActive("bold"));
+  // Only re-renders when bold state changes
+}
+```
+
+### Performance Rules
+- **Use `useEditorState` / `useTiptapState`** for selective state subscriptions — prevents full re-renders on every keystroke
+- **Debounce `onUpdate` callbacks** (200-300ms) when persisting to database or triggering expensive operations
+- **Avoid `trackNodeViewPosition`** unless strictly necessary — it causes per-keystroke position recalculation
+- **Split toolbar into smaller components** each subscribing to only their relevant state
+- **Memoize extension arrays** — recreating on every render causes editor reinitialization
+
+## Cursor and Selection
+
+```tsx
+editor.commands.focus();                    // restore focus
+editor.commands.focus("start");             // cursor to start
+editor.commands.focus("end");               // cursor to end
+editor.commands.focus(10);                  // cursor to position 10
+editor.commands.setTextSelection(10);       // set cursor position
+editor.commands.setTextSelection({ from: 5, to: 10 }); // select range
+```
+
+## Integration with Resume Builder
+- Store editor content as JSON in the Zustand resume store
+- On content change, debounce and update the store, which triggers PDF re-render
+- Map Tiptap JSON to react-pdf components for the PDF template
+- Map Tiptap JSON to docx Paragraph/TextRun for DOCX export
+- Keep the content transformation functions in `src/lib/export/` — separate from UI
